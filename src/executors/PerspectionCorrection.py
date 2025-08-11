@@ -230,7 +230,7 @@ class PerspectiveCorrection(Component):
             threshold_intersect_min=50,
             threshold_distance=0.2,
             perpendicular_margin=np.pi / 12,
-            intermediate=False
+            intermediate=True
         )
         corrected_img = corrected_tuple[0]
 

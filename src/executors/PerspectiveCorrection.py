@@ -3,7 +3,6 @@ import sys
 import cv2
 import numpy as np
 from PIL import Image as PILImage
-from sklearn.cluster import DBSCAN
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
 

@@ -14,63 +14,142 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 def order_points(pts):
+    """
+    Köşeleri sıralar: top-left, top-right, bottom-right, bottom-left
+    """
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # top-left
-    rect[2] = pts[np.argmax(s)]  # bottom-right
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
 
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+
     return rect
 
 
-def automatic_gamma(img, target=0.5):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) / 255.0
-    mean = gray.mean()
-    if mean <= 0:
-        return 1.0
-    gamma = np.log(target) / np.log(mean)
-    return max(0.3, min(gamma, 3.0))
-
-
-def sharpen(img):
-    blur = cv2.GaussianBlur(img, (0, 0), 3)
-    return cv2.addWeighted(img, 1.5, blur, -0.5, 0)
-
-
-def preprocess(img):
+def enhance_image(img):
+    """
+    Görüntüyü CLAHE, gamma correction ve unsharp mask ile güçlendirir.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE ile kontrast artırma
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
-    gamma_val = automatic_gamma(img)
-    table = np.array([(i / 255.0) ** (1.0 / gamma_val) * 255 for i in range(256)]).astype(np.uint8)
+    # Gamma correction otomatik hesaplama
+    mean = np.mean(enhanced) / 255.0
+    gamma = np.log(0.5) / np.log(mean) if mean > 0 else 1.0
+    gamma = np.clip(gamma, 0.3, 3.0)
+    table = np.array([(i / 255.0) ** (1.0 / gamma) * 255 for i in range(256)]).astype(np.uint8)
     gamma_corrected = cv2.LUT(enhanced, table)
 
-    sharpened = sharpen(gamma_corrected)
-    blurred = cv2.GaussianBlur(sharpened, (5, 5), 0)
-    return blurred
+    # Unsharp mask (keskinleştirme)
+    blur = cv2.GaussianBlur(gamma_corrected, (0, 0), 3)
+    sharp = cv2.addWeighted(gamma_corrected, 1.5, blur, -0.5, 0)
+
+    return sharp
 
 
-def detect_corners(img):
-    corners = cv2.goodFeaturesToTrack(img, maxCorners=20, qualityLevel=0.01, minDistance=20)
-    if corners is None or len(corners) < 4:
-        # fallback contour detection
-        contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        for cnt in contours:
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.contourArea(approx) > 1000:
-                return order_points(approx.reshape(4, 2))
+def find_line_intersections(lines, img_shape):
+    """
+    Hough çizgilerinin kesişim noktalarını bulur.
+    """
+    def line_params(rho, theta):
+        a = np.cos(theta)
+        b = np.sin(theta)
+        x0 = a * rho
+        y0 = b * rho
+        # iki nokta (x1,y1), (x2,y2)
+        x1 = int(x0 + 1000 * (-b))
+        y1 = int(y0 + 1000 * (a))
+        x2 = int(x0 - 1000 * (-b))
+        y2 = int(y0 - 1000 * (a))
+        return (x1, y1), (x2, y2)
+
+    intersections = []
+    for i in range(len(lines)):
+        for j in range(i+1, len(lines)):
+            rho1, theta1 = lines[i][0]
+            rho2, theta2 = lines[j][0]
+            # Doğrular paralel mi kontrolü
+            if abs(theta1 - theta2) < np.deg2rad(10):
+                continue
+
+            (x1, y1), (x2, y2) = line_params(rho1, theta1)
+            (x3, y3), (x4, y4) = line_params(rho2, theta2)
+
+            # İki doğrunun kesişim noktası (Cramer yöntemi)
+            denom = (x1 - x2)*(y3 - y4) - (y1 - y2)*(x3 - x4)
+            if denom == 0:
+                continue
+            px = ((x1*y2 - y1*x2)*(x3 - x4) - (x1 - x2)*(x3*y4 - y3*x4)) / denom
+            py = ((x1*y2 - y1*x2)*(y3 - y4) - (y1 - y2)*(x3*y4 - y3*x4)) / denom
+
+            # Görüntü sınırları içinde mi?
+            if 0 <= px < img_shape[1] and 0 <= py < img_shape[0]:
+                intersections.append([px, py])
+
+    return np.array(intersections, dtype=np.float32)
+
+
+def filter_corners(corners):
+    """
+    Aynı noktaya yakın çoklu köşeleri grupla ve merkezlerini al.
+    """
+    if len(corners) == 0:
+        return np.array([])
+
+    # Kümeleme için epsilon
+    epsilon = 20.0
+    grouped = []
+
+    for pt in corners:
+        added = False
+        for group in grouped:
+            if np.linalg.norm(np.array(group) - pt) < epsilon:
+                # Güncelle ortalama
+                group[0] = (group[0] + pt[0]) / 2
+                group[1] = (group[1] + pt[1]) / 2
+                added = True
+                break
+        if not added:
+            grouped.append([pt[0], pt[1]])
+
+    return np.array(grouped, dtype=np.float32)
+
+
+def detect_corners_by_lines(img):
+    """
+    Güçlü ön işleme sonrası Canny, Hough ile çizgileri bul,
+    çizgi kesişimlerini hesapla ve 4 köşe seç.
+    """
+    enhanced = enhance_image(img)
+
+    edges = cv2.Canny(enhanced, 50, 150, apertureSize=3)
+    edges = cv2.dilate(edges, np.ones((3,3),np.uint8), iterations=1)
+
+    lines = cv2.HoughLines(edges, 1, np.pi/180, 150)
+    if lines is None:
         return None
-    corners = np.squeeze(corners)
-    if len(corners) > 4:
-        center = corners.mean(axis=0)
-        dists = np.linalg.norm(corners - center, axis=1)
-        idxs = np.argsort(dists)[-4:]
-        corners = corners[idxs]
+
+    intersections = find_line_intersections(lines, img.shape)
+    if len(intersections) < 4:
+        return None
+
+    filtered = filter_corners(intersections)
+
+    if len(filtered) < 4:
+        return None
+
+    # Merkeze göre en uzak 4 noktayı seç (belge köşeleri)
+    center = np.mean(filtered, axis=0)
+    dists = np.linalg.norm(filtered - center, axis=1)
+    idxs = np.argsort(dists)[-4:]
+    corners = filtered[idxs]
+
     return order_points(corners)
 
 
@@ -94,13 +173,9 @@ def four_point_transform(img, pts):
 
 
 def correct_perspective(img):
-    pre = preprocess(img)
-    edges = cv2.Canny(pre, 50, 150)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-
-    corners = detect_corners(edges)
+    corners = detect_corners_by_lines(img)
     if corners is None:
-        raise ValueError("Belge köşeleri bulunamadı.")
+        raise ValueError("Belge köşeleri tespit edilemedi.")
 
     warped = four_point_transform(img, corners)
     return PILImage.fromarray(warped)

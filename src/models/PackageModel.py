@@ -112,7 +112,7 @@ class PerspectiveCorrectionResponse(Response):
     outputs: PerspectiveCorrectionOutputs
 
 
-class PackageExecutor(Config):
+class PerspectiveCorrectionExecutor(Config):
     name: Literal["PerspectiveCorrection"] = "PerspectiveCorrection"
     value: Union[PerspectiveCorrectionRequest, PerspectiveCorrectionResponse]
     type: Literal["object"] = "object"

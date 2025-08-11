@@ -89,19 +89,37 @@ def good_features_polygon_corners(edge_img, max_corners, quality_level, min_dist
     idxs = np.argsort(dists)[-4:]
     return corners[idxs]
 
+def detect_corners(img, max_corners=10, quality=0.01, min_distance=30):
+    corners = cv2.goodFeaturesToTrack(img, maxCorners=max_corners, qualityLevel=quality, minDistance=min_distance)
+    if corners is None or len(corners) < 4:
+        return None
+
+    # (N,1,2) → (N,2) yap
+    corners = corners.reshape(-1, 2)
+
+    if corners.shape[0] > 4:
+        center = np.mean(corners, axis=0)
+        dists = np.linalg.norm(corners - center, axis=1)
+        idxs = np.argsort(dists)[-4:]
+        corners = corners[idxs]
+
+    return reorder_corners(corners)
+
 
 def reorder_corners(corners):
+    if corners.shape[0] != 4:
+        raise ValueError("Köşe sayısı 4 olmalı.")
     mean = np.mean(corners, axis=0)
     ordered = np.zeros((4, 2), dtype=corners.dtype)
     for c in corners:
         if c[0] < mean[0] and c[1] < mean[1]:
-            ordered[0] = c  # upper-left
+            ordered[0] = c  # üst sol
         elif c[0] > mean[0] and c[1] < mean[1]:
-            ordered[1] = c  # upper-right
+            ordered[1] = c  # üst sağ
         elif c[0] > mean[0] and c[1] > mean[1]:
-            ordered[2] = c  # lower-right
+            ordered[2] = c  # alt sağ
         else:
-            ordered[3] = c  # lower-left
+            ordered[3] = c  # alt sol
     return ordered
 
 

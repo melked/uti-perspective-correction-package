@@ -45,60 +45,114 @@ def preprocess(img, clahe_clip=3.0, clahe_grid=(8, 8), gamma=1.0, blur_ksize=5):
 
 
 def detect_corners_combined(img, max_corners=10, quality=0.01, min_distance=30):
-    """Birden fazla yöntemle köşe algılar ve en iyisini seçer"""
+    """7 farklı yöntemle köşe algılar ve en iyisini seçer"""
+    h, w = img.shape[:2]
     methods = []
 
     # Method 1: GoodFeaturesToTrack (orijinal)
-    corners1 = cv2.goodFeaturesToTrack(img, maxCorners=max_corners, qualityLevel=quality, minDistance=min_distance)
-    if corners1 is not None and len(corners1) >= 4:
-        corners1 = np.squeeze(corners1)
-        if len(corners1) > 4:
-            center = np.mean(corners1, axis=0)
-            dists = np.linalg.norm(corners1 - center, axis=1)
-            corners1 = corners1[np.argsort(dists)[-4:]]
-        methods.append(("goodfeatures", corners1[:4]))
+    corners = cv2.goodFeaturesToTrack(img, maxCorners=max_corners, qualityLevel=quality, minDistance=min_distance)
+    if corners is not None and len(corners) >= 4:
+        corners = np.squeeze(corners)
+        if len(corners) > 4:
+            center = np.mean(corners, axis=0)
+            dists = np.linalg.norm(corners - center, axis=1)
+            corners = corners[np.argsort(dists)[-4:]]
+        methods.append(corners[:4])
 
-    # Method 2: Contour + ApproxPolyDP
+    # Method 2: GoodFeaturesToTrack (daha hassas)
+    corners = cv2.goodFeaturesToTrack(img, maxCorners=20, qualityLevel=0.005, minDistance=15)
+    if corners is not None and len(corners) >= 4:
+        corners = np.squeeze(corners)
+        center = np.mean(corners, axis=0)
+        dists = np.linalg.norm(corners - center, axis=1)
+        corners = corners[np.argsort(dists)[-4:]]
+        methods.append(corners)
+
+    # Method 3: Contour + ApproxPolyDP (gevşek)
     contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         largest = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest) > 1000:
-            hull = cv2.convexHull(largest)
-            epsilon = 0.02 * cv2.arcLength(hull, True)
-            approx = cv2.approxPolyDP(hull, epsilon, True)
+        if cv2.contourArea(largest) > 500:
+            epsilon = 0.02 * cv2.arcLength(largest, True)
+            approx = cv2.approxPolyDP(largest, epsilon, True)
             if len(approx) >= 4:
-                corners2 = approx.reshape(-1, 2)[:4]
-                methods.append(("contour", corners2))
+                methods.append(approx.reshape(-1, 2)[:4])
 
-    # Method 3: Hough Lines (basitleştirilmiş)
-    lines = cv2.HoughLinesP(img, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
-    if lines is not None and len(lines) >= 4:
-        # Sadece en uzun 4 çizgiyi al ve köşe olarak uç noktalarını kullan
+    # Method 4: Contour + ApproxPolyDP (sıkı)
+    if contours:
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:3]:
+            if cv2.contourArea(contour) > 1000:
+                hull = cv2.convexHull(contour)
+                epsilon = 0.01 * cv2.arcLength(hull, True)
+                approx = cv2.approxPolyDP(hull, epsilon, True)
+                if len(approx) >= 4:
+                    methods.append(approx.reshape(-1, 2)[:4])
+                    break
+
+    # Method 5: Hough Lines kesişimleri
+    lines = cv2.HoughLinesP(img, 1, np.pi / 180, 80, minLineLength=w // 4, maxLineGap=20)
+    if lines is not None and len(lines) >= 3:
+        intersections = []
         lines = lines.reshape(-1, 4)
-        lengths = [np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) for x1, y1, x2, y2 in lines]
-        longest_indices = np.argsort(lengths)[-4:]
-        corners3 = []
-        for idx in longest_indices:
-            x1, y1, x2, y2 = lines[idx]
-            corners3.extend([[x1, y1], [x2, y2]])
-        if len(corners3) >= 4:
-            corners3 = np.array(corners3)
-            # En dış 4 köşeyi seç
-            center = np.mean(corners3, axis=0)
-            dists = np.linalg.norm(corners3 - center, axis=1)
-            corners3 = corners3[np.argsort(dists)[-4:]]
-            methods.append(("hough", corners3))
+        for i in range(len(lines)):
+            for j in range(i + 1, min(len(lines), i + 10)):  # Sadece yakın çizgiler
+                x1, y1, x2, y2 = lines[i]
+                x3, y3, x4, y4 = lines[j]
+                denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+                if abs(denom) > 1e-6:
+                    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+                    x = x1 + t * (x2 - x1)
+                    y = y1 + t * (y2 - y1)
+                    if 0 <= x < w and 0 <= y < h:
+                        intersections.append([x, y])
+        if len(intersections) >= 4:
+            intersections = np.array(intersections)
+            center = np.mean(intersections, axis=0)
+            dists = np.linalg.norm(intersections - center, axis=1)
+            methods.append(intersections[np.argsort(dists)[-4:]])
 
-    # En iyi yöntemi seç (en büyük alan kriteri)
+    # Method 6: Corner dilation (morfolojik)
+    kernel = np.ones((3, 3), np.uint8)
+    dilated = cv2.dilate(img, kernel, iterations=1)
+    corners = cv2.goodFeaturesToTrack(dilated, maxCorners=15, qualityLevel=0.01, minDistance=20)
+    if corners is not None and len(corners) >= 4:
+        corners = np.squeeze(corners)
+        center = np.mean(corners, axis=0)
+        dists = np.linalg.norm(corners - center, axis=1)
+        methods.append(corners[np.argsort(dists)[-4:]])
+
+    # Method 7: Grid-based corner detection (son çare)
+    if not methods:
+        grid_corners = []
+        for i in [0.1, 0.9]:
+            for j in [0.1, 0.9]:
+                grid_corners.append([int(i * w), int(j * h)])
+        methods.append(np.array(grid_corners))
+
+    # En iyi yöntemi seç (alan + şekil uygunluğu)
     best_corners = None
-    best_area = 0
+    best_score = 0
 
-    for name, corners in methods:
+    for corners in methods:
         try:
-            ordered = reorder_corners(corners)
+            if len(corners) < 4: continue
+            ordered = reorder_corners(corners[:4])
             area = cv2.contourArea(ordered.astype(np.float32))
-            if area > best_area:
-                best_area = area
+
+            # Dikdörtgen uygunluk skoru
+            side_lengths = []
+            for i in range(4):
+                p1, p2 = ordered[i], ordered[(i + 1) % 4]
+                side_lengths.append(np.linalg.norm(p2 - p1))
+
+            # Karşılıklı kenarların benzerliği
+            ratio1 = min(side_lengths[0], side_lengths[2]) / max(side_lengths[0], side_lengths[2])
+            ratio2 = min(side_lengths[1], side_lengths[3]) / max(side_lengths[1], side_lengths[3])
+            shape_score = (ratio1 + ratio2) / 2
+
+            score = area * shape_score
+            if score > best_score:
+                best_score = score
                 best_corners = ordered
         except:
             continue

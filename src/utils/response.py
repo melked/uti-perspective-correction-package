@@ -1,15 +1,20 @@
-
 from sdks.novavision.src.helper.package import PackageHelper
-from components.Package.src.models.PackageModel import PackageModel, PackageConfigs, ConfigExecutor, PackageOutputs, PackageResponse, PackageExecutor, OutputImage
-
+from components.PerspectiveCorrection.src.models.PackageModel import (
+    PackageModel,
+    PackageConfigs,
+    ConfigExecutor,
+    PerspectiveCorrectionOutputs,
+    PerspectiveCorrectionResponse,
+    PerspectiveCorrectionExecutor,
+    OutputImage
+)
 
 def build_response(context):
-    outputImage = OutputImage(value=context.image)
-    Outputs = PackageOutputs(outputImage=outputImage)
-    packageResponse = PackageResponse(outputs=Outputs)
-    packageExecutor = PackageExecutor(value=packageResponse)
-    executor = ConfigExecutor(value=packageExecutor)
-    packageConfigs = PackageConfigs(executor=executor)
-    package = PackageHelper(packageModel=PackageModel, packageConfigs=packageConfigs)
-    packageModel = package.build_model(context)
-    return packageModel
+    output_image = OutputImage(value=context.image)
+    outputs = PerspectiveCorrectionOutputs(outputImage=output_image)
+    perspective_response = PerspectiveCorrectionResponse(outputs=outputs)
+    perspective_executor = PerspectiveCorrectionExecutor(value=perspective_response)
+    executor = ConfigExecutor(value=perspective_executor)
+    package_configs = PackageConfigs(executor=executor)
+    package = PackageHelper(packageModel=PackageModel, packageConfigs=package_configs)
+    return package.build_model(context)

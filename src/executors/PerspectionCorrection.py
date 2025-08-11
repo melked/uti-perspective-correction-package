@@ -11,11 +11,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
-from components.Package.src.utils.response import build_response
-from components.Package.src.models.PackageModel import PackageModel
+from components.PerspectiveCorrection.src.utils.response import build_response
+from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
-class Package(Component):
+class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.request.model = PackageModel(**(self.request.data))

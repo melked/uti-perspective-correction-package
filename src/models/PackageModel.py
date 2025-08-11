@@ -85,22 +85,22 @@ class Degree(Config):
         title = "Angle"
 
 
-class PackageInputs(Inputs):
+class PerspectiveCorrectionInputs(Inputs):
     inputImage: InputImage
 
 
-class PackageConfigs(Configs):
+class PerspectiveCorrectionConfigs(Configs):
     degree: Degree
     drawBBox: KeepSideBBox
 
 
-class PackageOutputs(Outputs):
+class PerspectiveCorrectionOutputs(Outputs):
     outputImage: OutputImage
 
 
-class PackageRequest(Request):
-    inputs: Optional[PackageInputs]
-    configs: PackageConfigs
+class PerspectiveCorrectionRequest(Request):
+    inputs: Optional[PerspectiveCorrectionInputs]
+    configs: PerspectiveCorrectionConfigs
 
     class Config:
         json_schema_extra = {
@@ -108,18 +108,18 @@ class PackageRequest(Request):
         }
 
 
-class PackageResponse(Response):
-    outputs: PackageOutputs
+class PerspectiveCorrectionResponse(Response):
+    outputs: PerspectiveCorrectionOutputs
 
 
 class PackageExecutor(Config):
-    name: Literal["Package"] = "Package"
-    value: Union[PackageRequest, PackageResponse]
+    name: Literal["PerspectiveCorrection"] = "PerspectiveCorrection"
+    value: Union[PerspectiveCorrectionRequest, PerspectiveCorrectionResponse]
     type: Literal["object"] = "object"
     field: Literal["option"] = "option"
 
     class Config:
-        title = "Package"
+        title = "PerspectiveCorrection"
         json_schema_extra = {
             "target": {
                 "value": 0
@@ -147,4 +147,4 @@ class PackageConfigs(Configs):
 class PackageModel(Package):
     configs: PackageConfigs
     type: Literal["component"] = "component"
-    name: Literal["Package"] = "Package"
+    name: Literal["PerspectiveCorrection"] = "PerspectiveCorrection"

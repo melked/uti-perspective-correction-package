@@ -92,12 +92,16 @@ def line_intersections(lines):
             [np.cos(theta1), np.sin(theta1)],
             [np.cos(theta2), np.sin(theta2)]
         ])
-        b = np.array([[rho1],[rho2]])
+        b = np.array([[rho1], [rho2]])
         det = np.linalg.det(A)
         if abs(det) < 1e-10:
             return None
         x0, y0 = np.linalg.solve(A, b)
+        # Burada x0, y0 muhtemelen ndarray, önce skalar float yapalım:
+        x0 = float(x0)
+        y0 = float(y0)
         return [int(round(x0)), int(round(y0))]
+
     points = []
     for i in range(len(lines)):
         for j in range(i+1, len(lines)):
@@ -105,6 +109,7 @@ def line_intersections(lines):
             if pt is not None:
                 points.append(pt)
     return np.array(points)
+
 
 def cluster_points(points, eps=30, min_samples=1):
     if len(points) == 0:

@@ -25,7 +25,7 @@ class Params:
         self.min_distance = config.get("min_distance", 20)
         self.contour_area_thresh = config.get("contour_area_thresh", 1000)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
-        # Canny eşikleri opsiyonel, yoksa otomatik hesaplanacak
+        self.hough_threshold = config.get("hough_threshold", 100)
         self.canny_min = config.get("canny_min", None)
         self.canny_max = config.get("canny_max", None)
 
@@ -44,15 +44,49 @@ def order_points(pts):
 
 def preprocess(img, params: Params):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # CLAHE parametreleri
     clahe = cv2.createCLAHE(clipLimit=params.clahe_clip, tileGridSize=params.clahe_grid)
     enhanced = clahe.apply(gray)
-
-    # Opsiyonel bulanıklaştırma (gürültü azaltmak için)
     blurred = cv2.GaussianBlur(enhanced, params.blur_ksize, 0)
-
     return blurred
+
+
+def line_intersections(lines):
+    def compute_intersection(l1, l2):
+        rho1, theta1 = l1
+        rho2, theta2 = l2
+        A = np.array([
+            [np.cos(theta1), np.sin(theta1)],
+            [np.cos(theta2), np.sin(theta2)]
+        ])
+        b = np.array([[rho1], [rho2]])
+        det = np.linalg.det(A)
+        if abs(det) < 1e-10:
+            return None
+        x0, y0 = np.linalg.solve(A, b)
+        return [int(round(x0)), int(round(y0))]
+
+    points = []
+    for i in range(len(lines)):
+        for j in range(i+1, len(lines)):
+            pt = compute_intersection(lines[i], lines[j])
+            if pt is not None:
+                points.append(pt)
+    return np.array(points)
+
+
+def detect_corners_with_hough(edges, params: Params):
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, params.hough_threshold)
+    if lines is None or len(lines) < 2:
+        return None
+    lines = lines[:, 0, :]
+    points = line_intersections(lines)
+    if len(points) < 4:
+        return None
+    center = points.mean(axis=0)
+    dists = np.linalg.norm(points - center, axis=1)
+    idxs = np.argsort(dists)[-4:]
+    corners = points[idxs]
+    return order_points(corners.astype(np.float32))
 
 
 def detect_corners(img, params: Params):
@@ -68,7 +102,8 @@ def detect_corners(img, params: Params):
             approx = cv2.approxPolyDP(cnt, params.approx_poly_epsilon_ratio * peri, True)
             if len(approx) == 4 and cv2.contourArea(approx) > params.contour_area_thresh:
                 return order_points(approx.reshape(4, 2))
-        return None
+        # Hough fallback
+        return detect_corners_with_hough(img, params)
     corners = np.squeeze(corners)
     if len(corners) > 4:
         center = corners.mean(axis=0)
@@ -105,7 +140,6 @@ def four_point_transform(img, pts):
 def correct_perspective(img, params: Params):
     pre = preprocess(img, params)
 
-    # Otomatik Canny eşiği hesaplama (median tabanlı)
     if params.canny_min is None or params.canny_max is None:
         v = np.median(pre)
         sigma = 0.33

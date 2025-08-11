@@ -44,9 +44,14 @@ def order_points(pts):
 
 def preprocess(img, params: Params):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # CLAHE parametreleri
     clahe = cv2.createCLAHE(clipLimit=params.clahe_clip, tileGridSize=params.clahe_grid)
     enhanced = clahe.apply(gray)
+
+    # Opsiyonel bulanıklaştırma (gürültü azaltmak için)
     blurred = cv2.GaussianBlur(enhanced, params.blur_ksize, 0)
+
     return blurred
 
 

@@ -238,18 +238,23 @@ class PerspectiveCorrection(Component):
 
     def run(self):
         img = Image.get_frame(img=self.image, redis_db=self.redis_db)
-        img_np = img.value  # OpenCV numpy array (BGR)
+        img_np = img.value
 
-        # Perspektif düzelt
+        # Tip dönüşümü ve kanal kontrolü
+        if img_np.dtype != np.uint8:
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).astype(np.uint8)
+            else:
+                img_np = img_np.astype(np.uint8)
+
+        # Perspektif düzeltme
         corrected_tuple = correct_perspective(img_np, intermediate=False)
-        corrected_img = corrected_tuple[0]  # tuple döner, ilk eleman düzeltme sonucu
+        corrected_img = corrected_tuple[0]
 
-        # Güncelle
         img.value = np.array(corrected_img)
 
         self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
 
-        # Response hazırla
         packageModel = build_response(context=self)
         return packageModel
 

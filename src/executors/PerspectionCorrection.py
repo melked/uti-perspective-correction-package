@@ -14,96 +14,7 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
-BLUE = (0, 0, 255)
-GREEN = (0, 255, 0)
-RED = (255, 0, 0)
-
-
-def get_intersections(img, lines):
-    height, width, _ = img.shape
-    line_count = len(lines)
-    intersections = [[[] for _ in range(line_count)] for _ in range(line_count)]
-
-    for i, pointsa in enumerate(lines):
-        x1, y1, x2, y2 = pointsa
-        for j, pointsb in enumerate(lines):
-            if intersections[i][j]:
-                continue
-            x3, y3, x4, y4 = pointsb
-
-            d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-            if d != 0:
-                x = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / d
-                y = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / d
-                if 0 <= x <= width and 0 <= y <= height:
-                    intersections[i][j] = (int(x), int(y))
-                    intersections[j][i] = (int(x), int(y))
-
-    return intersections
-
-
-def annotate_corners(img, corners):
-    temp = np.array(img)
-    for x, y in corners:
-        cv2.circle(temp, (int(x), int(y)), 20, GREEN, 10)
-    return temp
-
-
-def get_corners(intersections):
-    pts = list(set(i for j in intersections for i in j if i))
-    return np.array(pts, dtype=np.float32)[:4]
-
-
-def filter_perpendicular(lines, margin):
-    perpendicular = np.pi / 2
-    count = np.zeros(len(lines))
-    from itertools import combinations
-    for a, b in combinations(range(len(lines)), 2):
-        if abs(abs(lines[a][1] - lines[b][1]) - perpendicular) < margin:
-            count[a] += 1
-            count[b] += 1
-    lines = np.array(lines)
-    return lines[count >= 2]
-
-
-def line_distance(line_a, line_b):
-    rho_a, theta_a = line_a
-    rho_b, theta_b = line_b
-    result = rho_a ** 2 + rho_b ** 2 - 2 * rho_b * rho_a * np.cos(theta_a - theta_b)
-    return np.sqrt(result)
-
-
-def eliminate_duplicates(img, lines, threshold):
-    eliminated = np.zeros(len(lines), dtype=bool)
-    min_distance = max(img.shape[:2]) * threshold
-    min_theta = np.pi * threshold
-    from itertools import combinations
-    for i, j in combinations(range(len(lines)), 2):
-        if eliminated[i] or eliminated[j]:
-            continue
-        line_a, line_b = lines[i], lines[j]
-        theta_diff = abs(line_a[1] - line_b[1])
-        if theta_diff > np.pi / 2:
-            theta_diff = np.pi - theta_diff
-        if line_distance(line_a, line_b) < min_distance and theta_diff < min_theta:
-            eliminated[i] = True
-    return lines[~eliminated]
-
-
-def to_cartesian(img, lines):
-    height, width, _ = img.shape
-    coff = max(height, width)
-    cartesian = []
-    for rho, theta in lines:
-        a, b = np.cos(theta), np.sin(theta)
-        x0, y0 = a * rho, b * rho
-        x1, y1 = int(x0 + coff * (-b)), int(y0 + coff * (a))
-        x2, y2 = int(x0 - coff * (-b)), int(y0 - coff * (a))
-        cartesian.append((x1, y1, x2, y2))
-    return cartesian
-
-
-def reorder(corners):
+def reorder_corners(corners):
     new_corners = np.zeros((4, 2), dtype=corners.dtype)
     mean = np.mean(corners, axis=0)
     for corner in corners:
@@ -118,94 +29,107 @@ def reorder(corners):
     return new_corners
 
 
-def enhance_image(img):
+def preprocess_image(
+    img,
+    clahe_clip=3.0,
+    clahe_grid=(8, 8),
+    blur_kernel=(5, 5),
+    gamma=1.0,
+):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl1 = clahe.apply(gray)
+    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_grid)
+    enhanced = clahe.apply(gray)
 
-    gamma = 1.2
-    lookUpTable = np.array([((i / 255.0) ** (1.0 / gamma)) * 255
-                          for i in np.arange(0, 256)]).astype("uint8")
-    gamma_corrected = cv2.LUT(cl1, lookUpTable)
+    # Gamma correction
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(256)]).astype("uint8")
+    gamma_corrected = cv2.LUT(enhanced, table)
 
-    blurred = cv2.GaussianBlur(gamma_corrected, (5, 5), 0)
-    blurred = cv2.medianBlur(blurred, 5)
+    blurred = cv2.GaussianBlur(gamma_corrected, blur_kernel, 0)
 
-    gaussian = cv2.GaussianBlur(blurred, (9, 9), 10.0)
-    unsharp = cv2.addWeighted(blurred, 1.5, gaussian, -0.5, 0)
+    return blurred
 
-    return unsharp
+
+def detect_corners(img, max_corners=10, quality=0.01, min_dist=30):
+    corners = cv2.goodFeaturesToTrack(img, maxCorners=max_corners, qualityLevel=quality, minDistance=min_dist)
+    if corners is not None:
+        return np.squeeze(corners)
+    else:
+        return None
 
 
 def correct_perspective(
     img,
-    threshold_max=150,
-    threshold_min=50,
-    rho=1,
-    theta=np.pi / 180,
-    threshold_intersect_start=150,
-    threshold_intersect_min=50,
-    threshold_distance=0.2,
-    perpendicular_margin=np.pi / 12,
+    clahe_clip=3.0,
+    clahe_grid=(8, 8),
+    blur_kernel=(5, 5),
+    gamma=1.0,
+    canny_min=50,
+    canny_max=150,
+    max_corners=10,
+    quality_level=0.01,
+    min_distance=30,
+    output_size_ratio=0.707,
     intermediate=False,
 ):
-    processed = enhance_image(img)
+    processed = preprocess_image(img, clahe_clip, clahe_grid, blur_kernel, gamma)
+
+    edges = cv2.Canny(processed, canny_min, canny_max)
+
+    corners = detect_corners(edges, max_corners=max_corners, quality=quality_level, min_dist=min_distance)
+
+    if corners is None or len(corners) < 4:
+        raise ValueError("Yeterli köşe bulunamadı")
+
+    # En uygun 4 köşeyi seç (örneğin en uzak 4 nokta)
+    # Basitçe 4 köşe seçelim
+    if len(corners) > 4:
+        # Örnek basit seçim: görüntü merkezi ile en uzak 4 nokta
+        center = np.mean(corners, axis=0)
+        dists = np.linalg.norm(corners - center, axis=1)
+        idxs = np.argsort(dists)[-4:]
+        corners = corners[idxs]
+
+    corners = reorder_corners(corners)
+
+    h, w = img.shape[:2]
+    min_dim = min(h, w)
+    new_w, new_h = int(min_dim), int(min_dim * output_size_ratio)
+
+    dst = np.float32([[0, 0], [new_w, 0], [new_w, new_h], [0, new_h]])
+
+    M = cv2.getPerspectiveTransform(corners.astype(np.float32), dst)
+    warped = cv2.warpPerspective(img, M, (new_w, new_h))
+
     if intermediate:
-        intermediate_images = []
-        intermediate_images.append(PILImage.fromarray(processed))
-
-    edges = cv2.Canny(processed, threshold_min, threshold_max)
-    if intermediate:
-        intermediate_images.append(PILImage.fromarray(edges))
-
-    threshold_intersect = threshold_intersect_start
-    lines = None
-
-    while threshold_intersect >= threshold_intersect_min:
-        lines = cv2.HoughLines(edges, rho, theta, threshold_intersect)
-        if lines is not None:
-            lines = filter_perpendicular(lines[0], perpendicular_margin)
-            lines = eliminate_duplicates(img, lines, threshold_distance)
-            if len(lines) >= 4:
-                break
-        threshold_intersect -= 10
-
-    if lines is None or len(lines) < 4:
-        raise ValueError("Could not detect enough lines for perspective correction")
-
-    cartesian = to_cartesian(img, lines)
-    if intermediate:
-        intermediate_images.append(PILImage.fromarray(annotate_corners(img, get_corners(get_intersections(img, cartesian)))))
-
-    intersections = get_intersections(img, cartesian)
-    corners = get_corners(intersections)
-
-    height, width, _ = img.shape
-    min_coff = min(height, width)
-    if height > width:
-        new_h, new_w = int(min_coff), int(min_coff * 0.707)
+        from PIL import Image as PILImage
+        return (
+            PILImage.fromarray(processed),
+            PILImage.fromarray(edges),
+            PILImage.fromarray(warped),
+        )
     else:
-        new_h, new_w = int(min_coff * 0.707), int(min_coff)
-
-    destination = np.float32([[0, 0], [new_w, 0], [new_w, new_h], [0, new_h]])
-
-    corners = reorder(corners)
-    trans_mat = cv2.getPerspectiveTransform(corners, destination)
-    final = cv2.warpPerspective(img, trans_mat, (new_w, new_h))
-
-    if intermediate:
-        intermediate_images.append(PILImage.fromarray(final))
-        return tuple(intermediate_images)
-    else:
-        return (PILImage.fromarray(final),)
+        from PIL import Image as PILImage
+        return (PILImage.fromarray(warped),)
 
 
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.request.model = PackageModel(**(self.request.data))
-        self.rotation_degree = self.request.get_param("Degree")
-        self.keep_side = self.request.get_param("KeepSide")
+        self.params = {
+            "clahe_clip": self.request.get_param("clahe_clip") or 3.0,
+            "clahe_grid": self.request.get_param("clahe_grid") or (8, 8),
+            "blur_kernel": self.request.get_param("blur_kernel") or (5, 5),
+            "gamma": self.request.get_param("gamma") or 1.0,
+            "canny_min": self.request.get_param("canny_min") or 50,
+            "canny_max": self.request.get_param("canny_max") or 150,
+            "max_corners": self.request.get_param("max_corners") or 10,
+            "quality_level": self.request.get_param("quality_level") or 0.01,
+            "min_distance": self.request.get_param("min_distance") or 30,
+            "output_size_ratio": self.request.get_param("output_size_ratio") or 0.707,
+            "intermediate": self.request.get_param("intermediate") or False,
+        }
         self.image = self.request.get_param("inputImage")
 
     @staticmethod
@@ -224,15 +148,20 @@ class PerspectiveCorrection(Component):
 
         corrected_tuple = correct_perspective(
             img_np,
-            threshold_max=150,
-            threshold_min=50,
-            threshold_intersect_start=150,
-            threshold_intersect_min=50,
-            threshold_distance=0.2,
-            perpendicular_margin=np.pi / 12,
-            intermediate=True
+            clahe_clip=self.params["clahe_clip"],
+            clahe_grid=self.params["clahe_grid"],
+            blur_kernel=self.params["blur_kernel"],
+            gamma=self.params["gamma"],
+            canny_min=self.params["canny_min"],
+            canny_max=self.params["canny_max"],
+            max_corners=self.params["max_corners"],
+            quality_level=self.params["quality_level"],
+            min_distance=self.params["min_distance"],
+            output_size_ratio=self.params["output_size_ratio"],
+            intermediate=self.params["intermediate"],
         )
-        corrected_img = corrected_tuple[0]
+
+        corrected_img = corrected_tuple[-1]
 
         img.value = np.array(corrected_img)
 

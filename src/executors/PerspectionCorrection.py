@@ -26,9 +26,18 @@ def preprocess(img, clahe_clip=3.0, clahe_grid=(8, 8), gamma=1.0, blur_ksize=5):
 
 def detect_corners(img, max_corners=50, quality=0.01, min_distance=10):
     corners = cv2.goodFeaturesToTrack(img, maxCorners=max_corners, qualityLevel=quality, minDistance=min_distance)
-    if corners is not None:
-        return np.squeeze(corners)
-    return None
+    if corners is None or len(corners) < 4:
+        return None
+    corners = np.squeeze(corners)
+    if corners.ndim == 1:
+        corners = corners[np.newaxis, :]  # Tek köşe varsa 2D yap
+    if len(corners) > 4:
+        center = np.mean(corners, axis=0)
+        dists = np.linalg.norm(corners - center, axis=1)
+        idxs = np.argsort(dists)[-4:]
+        corners = corners[idxs]
+    return reorder_corners(corners)
+
 
 
 def hull_approx_corners(corners):
@@ -51,7 +60,6 @@ def hough_line_corners(edge_img, min_line_len=50, max_line_gap=10):
         points.append((x1, y1))
         points.append((x2, y2))
 
-    # Tüm noktaların kesişimlerini hesapla
     intersections = []
     for (p1, p2), (p3, p4) in combinations(points, 2):
         denom = (p1[0] - p2[0]) * (p3[1] - p4[1]) - (p1[1] - p2[1]) * (p3[0] - p4[0])
@@ -61,9 +69,10 @@ def hough_line_corners(edge_img, min_line_len=50, max_line_gap=10):
         y = ((p1[0]*p2[1] - p1[1]*p2[0])*(p3[1]-p4[1]) - (p1[1]-p2[1])*(p3[0]*p4[1] - p3[1]*p4[0])) / denom
         if 0 <= x < edge_img.shape[1] and 0 <= y < edge_img.shape[0]:
             intersections.append([x, y])
+
     if len(intersections) < 4:
         return None
-    # Yakın noktaları grupla (örneğin 20 piksel eşik ile)
+
     intersections = np.array(intersections)
     clustered = []
     taken = np.zeros(len(intersections), dtype=bool)
@@ -77,12 +86,15 @@ def hough_line_corners(edge_img, min_line_len=50, max_line_gap=10):
                 cluster.append(other_pt)
                 taken[j] = True
         clustered.append(np.mean(cluster, axis=0))
+    clustered = np.array(clustered)
+
     if len(clustered) >= 4:
-        # En uzak 4 noktayı seç
         center = np.mean(clustered, axis=0)
         dists = np.linalg.norm(clustered - center, axis=1)
         idxs = np.argsort(dists)[-4:]
-        corners = np.array(clustered)[idxs]
+        corners = clustered[idxs]
+        if corners.ndim == 1:
+            corners = corners[np.newaxis, :]
         return corners
     return None
 

@@ -4,6 +4,7 @@ from components.PerspectiveCorrection.src.models.PackageModel import (
     PackageConfigs,
     ConfigExecutor,
     PerspectiveCorrectionOutputs,
+    PerspectiveCorrectionInputs,
     PerspectiveCorrectionResponse,
     PerspectiveCorrectionExecutor,
     OutputImage

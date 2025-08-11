@@ -14,19 +14,17 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
-def reorder_corners(corners):
-    mean = np.mean(corners, axis=0)
-    ordered = np.zeros((4, 2), dtype=corners.dtype)
-    for c in corners:
-        if c[0] < mean[0] and c[1] < mean[1]:
-            ordered[0] = c  # upper-left
-        elif c[0] > mean[0] and c[1] < mean[1]:
-            ordered[1] = c  # upper-right
-        elif c[0] > mean[0] and c[1] > mean[1]:
-            ordered[2] = c  # lower-right
-        else:
-            ordered[3] = c  # lower-left
-    return ordered
+def order_points(pts):
+    """Köşeleri top-left, top-right, bottom-right, bottom-left sırasına dizer."""
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    rect[0] = pts[np.argmin(s)]  # top-left
+    rect[2] = pts[np.argmax(s)]  # bottom-right
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    return rect
 
 
 def preprocess(img, clahe_clip=3.0, clahe_grid=(8, 8), gamma=1.0, blur_ksize=5):

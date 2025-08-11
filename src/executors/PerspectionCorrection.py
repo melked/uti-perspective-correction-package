@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import numpy as np
+
 from PIL import Image as PILImage
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
@@ -20,34 +21,25 @@ RED = (255, 0, 0)
 
 def get_intersections(img, lines):
     height, width, _ = img.shape
-    intersections = [[[] for _ in lines] for _ in lines]
+    line_count = len(lines)
+    intersections = [[[] for _ in range(line_count)] for _ in range(line_count)]
 
-    for i, (x1, y1, x2, y2) in enumerate(lines):
-        for j, (x3, y3, x4, y4) in enumerate(lines):
-            if i >= j:
-                continue  # Simetrik olduğundan işlem yapma
+    for i, pointsa in enumerate(lines):
+        x1, y1, x2, y2 = pointsa
+        for j, pointsb in enumerate(lines):
+            if intersections[i][j]:
+                continue
+            x3, y3, x4, y4 = pointsb
 
             d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-            if d == 0:
-                continue  # Paralel çizgiler
-
-            x = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / d
-            y = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / d
-
-            if 0 <= x <= width and 0 <= y <= height:
-                intersections[i][j] = (int(x), int(y))
-                intersections[j][i] = (int(x), int(y))
+            if d != 0:
+                x = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / d
+                y = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / d
+                if 0 <= x <= width and 0 <= y <= height:
+                    intersections[i][j] = (int(x), int(y))
+                    intersections[j][i] = (int(x), int(y))
 
     return intersections
-
-
-def annotate_intersections(img, intersections):
-    temp = np.array(img)
-    for row in intersections:
-        for point in row:
-            if point:
-                cv2.circle(temp, point, 20, RED, 10)
-    return temp
 
 
 def annotate_corners(img, corners):
@@ -58,22 +50,18 @@ def annotate_corners(img, corners):
 
 
 def get_corners(intersections):
-    # Tüm kesişim noktalarını listele, 4 tanesini al
-    pts = list(set(pt for row in intersections for pt in row if pt))
+    pts = list(set(i for j in intersections for i in j if i))
     return np.array(pts, dtype=np.float32)[:4]
 
 
 def filter_perpendicular(lines, margin):
     perpendicular = np.pi / 2
     count = np.zeros(len(lines))
-
     from itertools import combinations
     for a, b in combinations(range(len(lines)), 2):
-        angle_diff = abs(lines[a][1] - lines[b][1])
-        if abs(angle_diff - perpendicular) < margin:
+        if abs(abs(lines[a][1] - lines[b][1]) - perpendicular) < margin:
             count[a] += 1
             count[b] += 1
-
     lines = np.array(lines)
     return lines[count >= 2]
 
@@ -81,119 +69,116 @@ def filter_perpendicular(lines, margin):
 def line_distance(line_a, line_b):
     rho_a, theta_a = line_a
     rho_b, theta_b = line_b
-    dist = rho_a ** 2 + rho_b ** 2 - 2 * rho_a * rho_b * np.cos(theta_a - theta_b)
-    return np.sqrt(dist)
+    result = rho_a ** 2 + rho_b ** 2 - 2 * rho_b * rho_a * np.cos(theta_a - theta_b)
+    return np.sqrt(result)
 
 
 def eliminate_duplicates(img, lines, threshold):
     eliminated = np.zeros(len(lines), dtype=bool)
-    min_dist = max(img.shape[:2]) * threshold
+    min_distance = max(img.shape[:2]) * threshold
     min_theta = np.pi * threshold
-
     from itertools import combinations
     for i, j in combinations(range(len(lines)), 2):
         if eliminated[i] or eliminated[j]:
             continue
-
-        theta_diff = abs(lines[i][1] - lines[j][1])
+        line_a, line_b = lines[i], lines[j]
+        theta_diff = abs(line_a[1] - line_b[1])
         if theta_diff > np.pi / 2:
             theta_diff = np.pi - theta_diff
-
-        if line_distance(lines[i], lines[j]) < min_dist and theta_diff < min_theta:
+        if line_distance(line_a, line_b) < min_distance and theta_diff < min_theta:
             eliminated[i] = True
-
     return lines[~eliminated]
 
 
 def to_cartesian(img, lines):
     height, width, _ = img.shape
-    coeff = max(height, width)
+    coff = max(height, width)
     cartesian = []
     for rho, theta in lines:
         a, b = np.cos(theta), np.sin(theta)
         x0, y0 = a * rho, b * rho
-        x1, y1 = int(x0 + coeff * (-b)), int(y0 + coeff * a)
-        x2, y2 = int(x0 - coeff * (-b)), int(y0 - coeff * a)
+        x1, y1 = int(x0 + coff * (-b)), int(y0 + coff * (a))
+        x2, y2 = int(x0 - coff * (-b)), int(y0 - coff * (a))
         cartesian.append((x1, y1, x2, y2))
     return cartesian
-
-
-def annotate_lines(img, lines):
-    annotated = np.array(img)
-    for x1, y1, x2, y2 in lines:
-        cv2.line(annotated, (x1, y1), (x2, y2), BLUE, 10)
-    return annotated.astype(np.uint8)
 
 
 def reorder(corners):
     new_corners = np.zeros((4, 2), dtype=corners.dtype)
     mean = np.mean(corners, axis=0)
-
     for corner in corners:
-        x, y = corner
-        if x < mean[0] and y < mean[1]:
-            new_corners[0] = corner  # üst sol
-        elif x > mean[0] and y < mean[1]:
-            new_corners[1] = corner  # üst sağ
-        elif x > mean[0] and y > mean[1]:
-            new_corners[2] = corner  # alt sağ
-        else:
-            new_corners[3] = corner  # alt sol
-
+        if corner[0] < mean[0] and corner[1] < mean[1]:
+            new_corners[0] = corner  # upper-left
+        elif corner[0] > mean[0] and corner[1] < mean[1]:
+            new_corners[1] = corner  # upper-right
+        elif corner[0] > mean[0] and corner[1] > mean[1]:
+            new_corners[2] = corner  # lower-right
+        elif corner[0] < mean[0] and corner[1] > mean[1]:
+            new_corners[3] = corner  # lower-left
     return new_corners
+
+
+def enhance_image(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    cl1 = clahe.apply(gray)
+
+    gamma = 1.2
+    lookUpTable = np.array([((i / 255.0) ** (1.0 / gamma)) * 255
+                          for i in np.arange(0, 256)]).astype("uint8")
+    gamma_corrected = cv2.LUT(cl1, lookUpTable)
+
+    blurred = cv2.GaussianBlur(gamma_corrected, (5, 5), 0)
+    blurred = cv2.medianBlur(blurred, 5)
+
+    gaussian = cv2.GaussianBlur(blurred, (9, 9), 10.0)
+    unsharp = cv2.addWeighted(blurred, 1.5, gaussian, -0.5, 0)
+
+    return unsharp
 
 
 def correct_perspective(
     img,
-    threshold_max=140,
-    threshold_min=30,
-    median_blur_size=51,
+    threshold_max=150,
+    threshold_min=50,
     rho=1,
     theta=np.pi / 180,
-    threshold_intersect=250,
-    threshold_distance=0.15,
-    perpendicular_margin=np.pi / 18,
-    intermediate=True,
+    threshold_intersect_start=150,
+    threshold_intersect_min=50,
+    threshold_distance=0.2,
+    perpendicular_margin=np.pi / 12,
+    intermediate=False,
 ):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    processed = enhance_image(img)
     if intermediate:
-        gray_im = PILImage.fromarray(gray)
+        intermediate_images = []
+        intermediate_images.append(PILImage.fromarray(processed))
 
-    blurred = cv2.medianBlur(gray, median_blur_size)
+    edges = cv2.Canny(processed, threshold_min, threshold_max)
     if intermediate:
-        blurred_im = PILImage.fromarray(blurred)
+        intermediate_images.append(PILImage.fromarray(edges))
 
-    edges = cv2.Canny(blurred, threshold_min, threshold_max)
-    if intermediate:
-        edges_im = PILImage.fromarray(edges)
+    threshold_intersect = threshold_intersect_start
+    lines = None
 
-    lines = cv2.HoughLines(edges, rho, theta, threshold_intersect)
-    if lines is None:
-        raise ValueError("No lines detected for perspective correction")
-
-    lines = filter_perpendicular(lines[0], perpendicular_margin)
-    lines = eliminate_duplicates(img, lines, threshold_distance)
-
-    while len(lines) < 4 and threshold_intersect > 0:
-        threshold_intersect -= 10
+    while threshold_intersect >= threshold_intersect_min:
         lines = cv2.HoughLines(edges, rho, theta, threshold_intersect)
-        if lines is None:
-            continue
-        lines = filter_perpendicular(lines[0], perpendicular_margin)
-        lines = eliminate_duplicates(img, lines, threshold_distance)
+        if lines is not None:
+            lines = filter_perpendicular(lines[0], perpendicular_margin)
+            lines = eliminate_duplicates(img, lines, threshold_distance)
+            if len(lines) >= 4:
+                break
+        threshold_intersect -= 10
 
-    if len(lines) < 4:
+    if lines is None or len(lines) < 4:
         raise ValueError("Could not detect enough lines for perspective correction")
 
     cartesian = to_cartesian(img, lines)
     if intermediate:
-        lines_annotated = PILImage.fromarray(annotate_lines(img, cartesian))
+        intermediate_images.append(PILImage.fromarray(annotate_corners(img, get_corners(get_intersections(img, cartesian)))))
 
     intersections = get_intersections(img, cartesian)
     corners = get_corners(intersections)
-    print("number of corners:", len(corners))
-    if intermediate:
-        corners_annotated = PILImage.fromarray(annotate_corners(lines_annotated, corners))
 
     height, width, _ = img.shape
     min_coff = min(height, width)
@@ -209,7 +194,8 @@ def correct_perspective(
     final = cv2.warpPerspective(img, trans_mat, (new_w, new_h))
 
     if intermediate:
-        return gray_im, blurred_im, edges_im, lines_annotated, corners_annotated, PILImage.fromarray(final)
+        intermediate_images.append(PILImage.fromarray(final))
+        return tuple(intermediate_images)
     else:
         return (PILImage.fromarray(final),)
 
@@ -217,7 +203,7 @@ def correct_perspective(
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
-        self.request.model = PackageModel(**self.request.data)
+        self.request.model = PackageModel(**(self.request.data))
         self.rotation_degree = self.request.get_param("Degree")
         self.keep_side = self.request.get_param("KeepSide")
         self.image = self.request.get_param("inputImage")
@@ -231,16 +217,29 @@ class PerspectiveCorrection(Component):
         img_np = img.value
 
         if img_np.dtype != np.uint8:
-            img_np = (img_np * 255).astype(np.uint8) if img_np.max() <= 1.0 else img_np.astype(np.uint8)
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).astype(np.uint8)
+            else:
+                img_np = img_np.astype(np.uint8)
 
-        corrected_tuple = correct_perspective(img_np, intermediate=False)
+        corrected_tuple = correct_perspective(
+            img_np,
+            threshold_max=150,
+            threshold_min=50,
+            threshold_intersect_start=150,
+            threshold_intersect_min=50,
+            threshold_distance=0.2,
+            perpendicular_margin=np.pi / 12,
+            intermediate=False
+        )
         corrected_img = corrected_tuple[0]
 
         img.value = np.array(corrected_img)
 
         self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
 
-        return build_response(context=self)
+        packageModel = build_response(context=self)
+        return packageModel
 
 
 if __name__ == "__main__":

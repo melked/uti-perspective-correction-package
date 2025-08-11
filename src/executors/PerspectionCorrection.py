@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import os
 import sys
 import cv2
@@ -31,7 +28,7 @@ def get_intersections(img, lines):
         x1, y1, x2, y2 = pointsa
 
         for j, pointsb in enumerate(lines):
-            if len(intersections[i][j]) > 0:
+            if intersections[i][j]:
                 continue
             x3, y3, x4, y4 = pointsb
 
@@ -52,7 +49,7 @@ def annotate_intersections(img, intersections):
     temp = np.array(img)
     for row in intersections:
         for col in row:
-            if len(col) > 0:
+            if col:  # col boş değilse
                 cv2.circle(temp, col, 20, RED, 10)
     return temp
 
@@ -66,7 +63,7 @@ def annotate_corners(img, corners):
 
 def get_corners(lines, intersections):
     # Only handle 4 lines case
-    pts = list(set(i for j in intersections for i in j if len(i) > 0))
+    pts = list(set(i for j in intersections for i in j if i))
     return np.array(pts, dtype=np.float32)[:4]
 
 
@@ -82,6 +79,7 @@ def filter_perpendicular(lines, margin):
             count[a] += 1
             count[b] += 1
 
+    lines = np.array(lines)
     return lines[count >= 2]
 
 
@@ -96,7 +94,7 @@ def line_distance(line_a, line_b):
 
 def eliminate_duplicates(img, lines, threshold):
     eliminated = np.zeros(len(lines), dtype=bool)
-    min_distance = max(img.shape) * threshold
+    min_distance = max(img.shape[:2]) * threshold
     min_theta = np.pi * threshold
 
     from itertools import combinations
@@ -114,7 +112,7 @@ def eliminate_duplicates(img, lines, threshold):
         if line_distance(line_a, line_b) < min_distance and theta_diff < min_theta:
             eliminated[i] = True
 
-    return lines[eliminated == False]
+    return lines[~eliminated]
 
 
 def to_cartesian(img, lines):
@@ -131,24 +129,24 @@ def to_cartesian(img, lines):
 
 
 def annotate_lines(img, lines):
-    annnotated = np.array(img)
+    annotated = np.array(img)
     for x1, y1, x2, y2 in lines:
-        cv2.line(annnotated, (x1, y1), (x2, y2), BLUE, 10)
-    return annnotated.astype(np.uint8)
+        cv2.line(annotated, (x1, y1), (x2, y2), BLUE, 10)
+    return annotated.astype(np.uint8)
 
 
 def reorder(corners):
-    new_corners = np.array(corners)
+    new_corners = np.zeros((4, 2), dtype=corners.dtype)
     mean = np.mean(corners, axis=0)
 
     for corner in corners:
         if corner[0] < mean[0] and corner[1] < mean[1]:
             new_corners[0] = corner  # upper-left
-        if corner[0] > mean[0] and corner[1] < mean[1]:
+        elif corner[0] > mean[0] and corner[1] < mean[1]:
             new_corners[1] = corner  # upper-right
-        if corner[0] > mean[0] and corner[1] > mean[1]:
+        elif corner[0] > mean[0] and corner[1] > mean[1]:
             new_corners[2] = corner  # lower-right
-        if corner[0] < mean[0] and corner[1] > mean[1]:
+        elif corner[0] < mean[0] and corner[1] > mean[1]:
             new_corners[3] = corner  # lower-left
 
     return new_corners
@@ -185,14 +183,23 @@ def correct_perspective(
     # Hough lines
     lines = cv2.HoughLines(edges, rho, theta, threshold_intersect)
 
+    # Eğer lines None ise hata vermeden devam et
+    if lines is None:
+        raise ValueError("No lines detected for perspective correction")
+
     lines = filter_perpendicular(lines[0], perpendicular_margin)
     lines = eliminate_duplicates(img, lines, threshold_distance)
 
-    while len(lines) < 4:
+    while len(lines) < 4 and threshold_intersect > 0:
         threshold_intersect -= 10
         lines = cv2.HoughLines(edges, rho, theta, threshold_intersect)
+        if lines is None:
+            continue
         lines = filter_perpendicular(lines[0], perpendicular_margin)
         lines = eliminate_duplicates(img, lines, threshold_distance)
+
+    if len(lines) < 4:
+        raise ValueError("Could not detect enough lines for perspective correction")
 
     cartesian = to_cartesian(img, lines)
 

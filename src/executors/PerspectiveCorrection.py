@@ -50,13 +50,12 @@ def analyze_brightness(img):
 
 def adaptive_gamma(img, params: Params):
     brightness = analyze_brightness(img)
-    # Basit adaptif gamma ayarı
     if brightness < 0.3:
-        return min(3.0, params.gamma_target * 2.0)  # Karanlıksa gamma yüksel
+        return min(3.0, params.gamma_target * 2.0)
     elif brightness > 0.7:
-        return max(0.3, params.gamma_target * 0.6)  # Çok parlaksa düşür
+        return max(0.3, params.gamma_target * 0.6)
     else:
-        return params.gamma_target  # Normal durum
+        return params.gamma_target
 
 
 def order_points(pts):
@@ -83,8 +82,30 @@ def preprocess(img, params: Params):
     return blurred
 
 
+def angle(pt1, pt2, pt3):
+    v1 = pt1 - pt2
+    v2 = pt3 - pt2
+    cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    ang = np.arccos(np.clip(cos_theta, -1.0, 1.0))
+    return np.degrees(ang)
+
+
+def is_contour_convex_and_angles_good(pts):
+    pts = pts.reshape(4, 2)
+    if not cv2.isContourConvex(pts):
+        return False
+    for i in range(4):
+        p1 = pts[i]
+        p2 = pts[(i + 1) % 4]
+        p3 = pts[(i + 2) % 4]
+        ang = angle(p1, p2, p3)
+        if ang < 50 or ang > 130:
+            return False
+    return True
+
+
 def detect_corners(img, params: Params):
-    # Try Shi-Tomasi corners first
+    # Önce Shi-Tomasi köşe tespiti dene
     corners = cv2.goodFeaturesToTrack(img,
                                       maxCorners=params.max_good_features,
                                       qualityLevel=params.good_feature_quality,
@@ -93,21 +114,21 @@ def detect_corners(img, params: Params):
     if corners is not None and len(corners) >= 4:
         corners = np.squeeze(corners)
         if len(corners) > 4:
-            # Select the 4 corners furthest from the center
             center = corners.mean(axis=0)
             dists = np.linalg.norm(corners - center, axis=1)
             idxs = np.argsort(dists)[-4:]
             corners = corners[idxs]
         return order_points(corners)
     else:
-        # If Shi-Tomasi fails, try contour-based detection
+        # Shi-Tomasi başarısızsa kontur tabanlı tespit
         contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
         for cnt in contours:
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, params.approx_poly_epsilon_ratio * peri, True)
             if len(approx) == 4 and cv2.contourArea(approx) > params.min_contour_area:
-                return order_points(approx.reshape(4, 2))
+                if is_contour_convex_and_angles_good(approx):
+                    return order_points(approx.reshape(4, 2))
         return None
 
 
@@ -134,7 +155,6 @@ def four_point_transform(img, pts):
 def correct_perspective(img, params: Params):
     pre = preprocess(img, params)
 
-    # Try adaptive thresholding first
     thresh = cv2.adaptiveThreshold(pre, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY_INV, params.block_size_adaptive_thresh, params.c_adaptive_thresh)
     edges = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((params.morph_kernel_size, params.morph_kernel_size), np.uint8))
@@ -142,7 +162,6 @@ def correct_perspective(img, params: Params):
     corners = detect_corners(edges, params)
 
     if corners is None:
-        # If adaptive thresholding fails, try Canny edge detection
         edges = cv2.Canny(pre, params.canny_min, params.canny_max)
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((params.morph_kernel_size, params.morph_kernel_size), np.uint8))
         corners = detect_corners(edges, params)
@@ -159,7 +178,6 @@ class PerspectiveCorrection(Component):
         super().__init__(request, bootstrap)
         self.request.model = PackageModel(**(self.request.data))
         self.image = self.request.get_param("inputImage")
-        # Parametre opsiyonel olarak dışarıdan alınabilir
         params_data = self.request.get_param("params", None)
         if params_data is not None:
             self.params = Params(**params_data)

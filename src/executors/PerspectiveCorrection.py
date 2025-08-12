@@ -4,10 +4,6 @@ import cv2
 import numpy as np
 from typing import List
 
-from PIL import Image as PILImage
-
-
-
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
 from sdks.novavision.src.media.image import Image
@@ -64,7 +60,6 @@ def _adaptive_canny(gray: np.ndarray, sigma=0.33):
 
 
 def _preprocess_for_edges(img: np.ndarray, params: Params) -> np.ndarray:
-    # CLAHE on L channel (LAB) + mild denoise + unsharp
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     L, A, B = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=params.clahe_clip, tileGridSize=params.clahe_grid)
@@ -95,7 +90,6 @@ def _find_quad_from_contours(binary: np.ndarray, ref_img: np.ndarray, min_area_r
     return _full_image_quad(ref_img)
 
 
-# --- a few compact variants that cover most cases ---
 def _variant_clahe_canny(img: np.ndarray, params: Params) -> np.ndarray:
     pre = _preprocess_for_edges(img, params)
     gray = cv2.cvtColor(pre, cv2.COLOR_BGR2GRAY)
@@ -154,7 +148,6 @@ def detect_document_candidates(img: np.ndarray, params: Params) -> List[np.ndarr
 
 
 def _score_quad(img: np.ndarray, quad: np.ndarray) -> float:
-    # quick score: combination of area ratio and edge coverage inside quad
     h, w = img.shape[:2]
     img_area = h * w
     rect = _order_points(quad)
@@ -165,7 +158,7 @@ def _score_quad(img: np.ndarray, quad: np.ndarray) -> float:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
     edge_inside = (cv2.countNonZero(cv2.bitwise_and(edges, edges, mask=mask)) / (area + 1e-9))
-    return area_score * 0.7 + min(edge_inside, 0.01) * 30.0  # tuned weights
+    return area_score * 0.7 + min(edge_inside, 0.01) * 30.0
 
 
 def select_best_quad(img: np.ndarray, candidates: List[np.ndarray]) -> np.ndarray:

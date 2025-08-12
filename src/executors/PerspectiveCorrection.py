@@ -221,6 +221,7 @@ class PerspectiveCorrection(Component):
         if img_obj is None or img_obj.value is None:
             raise ValueError("No input image provided or failed to load.")
 
+
         img_np = img_obj.value
         if img_np.dtype != np.uint8:
             if img_np.max() <= 1.0:

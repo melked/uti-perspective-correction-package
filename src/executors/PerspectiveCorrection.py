@@ -3,7 +3,6 @@ import sys
 import cv2
 import numpy as np
 
-
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
 
 from sdks.novavision.src.media.image import Image
@@ -24,45 +23,119 @@ def order_points(pts):
     return rect
 
 
-def correct_perspective(image, params=None):
-    # 1. Ön işleme
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    gray = cv2.equalizeHist(gray)
+def correct_perspective_advanced(image, params=None):
+    gray_orig = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # 2. Kenar tespiti
-    edges = cv2.Canny(gray, 50, 150)
-    edges = cv2.dilate(edges, None, iterations=2)
-    edges = cv2.erode(edges, None, iterations=1)
+    def clahe(img):
+        clahe_obj = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        return clahe_obj.apply(img)
 
-    # 3. Hough ile çizgi tespiti
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=50, maxLineGap=10)
-    line_img = np.zeros_like(edges)
-    if lines is not None:
-        for l in lines:
-            x1, y1, x2, y2 = l[0]
-            cv2.line(line_img, (x1, y1), (x2, y2), 255, 2)
+    def unsharp_mask(img):
+        gaussian = cv2.GaussianBlur(img, (9, 9), 10.0)
+        return cv2.addWeighted(img, 1.5, gaussian, -0.5, 0)
 
-    # 4. Çizgilerden kontur bulma
-    contours, _ = cv2.findContours(line_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    biggest = None
-    max_area = 0
-    for cnt in contours:
+    def preprocess_variants(img):
+        variants = []
+        # Normal pipeline: CLAHE + Canny
+        v1 = clahe(img)
+        edges1 = cv2.Canny(v1, 50, 150)
+        variants.append(("normal", edges1))
+
+        # Agresif pipeline: CLAHE + Unsharp + Canny
+        v2 = unsharp_mask(clahe(img))
+        edges2 = cv2.Canny(v2, 50, 150)
+        variants.append(("agresif", edges2))
+
+        # Yumuşak pipeline: blur + adaptif threshold
+        v3 = cv2.GaussianBlur(img, (5, 5), 0)
+        thr = cv2.adaptiveThreshold(v3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 11, 2)
+        variants.append(("yumusak", thr))
+
+        return variants
+
+    def validate_contour(cnt, edges, img_shape):
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) != 4:
+            return None
+
+        if not cv2.isContourConvex(approx):
+            return None
+
         area = cv2.contourArea(approx)
-        if len(approx) == 4 and area > max_area:
-            biggest = approx
-            max_area = area
+        h, w = img_shape[:2]
+        if area < 0.01 * w * h or area > 0.9 * w * h:
+            return None
 
-    if biggest is None:
-        return image  # belge bulunamazsa orijinal görüntüyü döndür
+        pts = approx.reshape(4, 2)
+        # En-boy oranı kontrolü
+        widths = [np.linalg.norm(pts[i] - pts[(i+1) % 4]) for i in range(4)]
+        min_w, max_w = min(widths), max(widths)
+        if min_w / max_w < 0.2:
+            return None
 
-    # 5. Köşeleri sırala
-    pts = biggest.reshape(4, 2)
-    rect = order_points(pts)
+        # Kenar doğruluğu kontrolü
+        mask = np.zeros_like(edges)
+        cv2.drawContours(mask, [approx], -1, 255, 2)
+        overlap = cv2.countNonZero(cv2.bitwise_and(mask, edges))
+        total_edge = cv2.countNonZero(mask)
+        if total_edge == 0 or (overlap / total_edge) < 0.7:
+            return None
 
-    # 6. Perspektif dönüşümü
+        return approx
+
+    def score_contour(cnt, img_shape):
+        pts = cnt.reshape(4, 2)
+        h, w = img_shape[:2]
+        center = np.array([w/2, h/2])
+
+        # Alan skoru (orta büyüklükte avantajlı)
+        area = cv2.contourArea(cnt)
+        area_score = 1 - abs(area - 0.25*w*h) / (0.25*w*h)
+
+        # Dikdörtgensellik skoru (paralellik + açı uyumu)
+        widths = [np.linalg.norm(pts[i] - pts[(i+1)%4]) for i in range(4)]
+        height_diff = abs(widths[0] - widths[2]) / max(widths[0], widths[2])
+        width_diff = abs(widths[1] - widths[3]) / max(widths[1], widths[3])
+        rect_score = 1 - (height_diff + width_diff) / 2
+
+        # Merkezlenme skoru (görüntü merkezine yakınlık)
+        cnt_center = np.mean(pts, axis=0)
+        dist_center = np.linalg.norm(cnt_center - center)
+        max_dist = np.linalg.norm(np.array([w/2, h/2]))
+        center_score = 1 - (dist_center / max_dist)
+
+        return area_score + rect_score + center_score
+
+    variants = preprocess_variants(gray_orig)
+    candidates = []
+
+    for name, processed in variants:
+        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            valid = validate_contour(cnt, processed, image.shape)
+            if valid is not None:
+                score = score_contour(valid, image.shape)
+                candidates.append((score, valid))
+
+    if not candidates:
+        # Yedek plan: Dinamik threshold + köşe tespiti
+        thr = cv2.threshold(gray_orig, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            biggest = max(contours, key=cv2.contourArea)
+            peri = cv2.arcLength(biggest, True)
+            approx = cv2.approxPolyDP(biggest, 0.02 * peri, True)
+            if len(approx) == 4:
+                candidates.append((0, approx))
+
+    if not candidates:
+        return image  # Belge bulunamazsa orijinal görüntüyü döndür
+
+    best = max(candidates, key=lambda x: x[0])[1]
+    rect = order_points(best.reshape(4, 2))
+
     (tl, tr, br, bl) = rect
     widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
@@ -105,7 +178,7 @@ class PerspectiveCorrection(Component):
             else:
                 img_np = img_np.astype(np.uint8)
 
-        result_img = correct_perspective(img_np, self.params)
+        result_img = correct_perspective_advanced(img_np, self.params)
         img.value = np.array(result_img)
         self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
         return build_response(context=self)

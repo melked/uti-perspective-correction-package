@@ -177,7 +177,7 @@ def select_best_quad(img: np.ndarray, candidates: List[np.ndarray]) -> np.ndarra
     return best
 
 
-class PerspectiveTransformation(Component):
+class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}

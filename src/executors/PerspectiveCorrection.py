@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import numpy as np
+from typing import List
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
 

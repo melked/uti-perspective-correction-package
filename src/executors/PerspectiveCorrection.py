@@ -2,7 +2,7 @@ import os
 import sys
 import cv2
 import numpy as np
-from PIL import Image as PILImage
+
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
 
@@ -18,7 +18,6 @@ def order_points(pts):
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]  # top-left
     rect[2] = pts[np.argmax(s)]  # bottom-right
-
     diff = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(diff)]  # top-right
     rect[3] = pts[np.argmax(diff)]  # bottom-left
@@ -57,7 +56,7 @@ def correct_perspective(image, params=None):
             max_area = area
 
     if biggest is None:
-        return image  # belge bulunamazsa orijinal dön
+        return image  # belge bulunamazsa orijinal görüntüyü döndür
 
     # 5. Köşeleri sırala
     pts = biggest.reshape(4, 2)
@@ -87,6 +86,16 @@ def correct_perspective(image, params=None):
 
 
 class PerspectiveCorrection(Component):
+    def __init__(self, request, bootstrap):
+        super().__init__(request, bootstrap)
+        self.request.model = PackageModel(**(self.request.data))
+        self.image = self.request.get_param("inputImage")
+        self.params = self.request.get_param("params", None)
+
+    @staticmethod
+    def bootstrap(config: dict) -> dict:
+        return {}
+
     def run(self):
         img = Image.get_frame(img=self.image, redis_db=self.redis_db)
         img_np = img.value

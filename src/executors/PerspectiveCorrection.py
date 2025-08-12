@@ -13,181 +13,80 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
-class Params:
-    def __init__(self,
-                 clahe_clip=3.0,
-                 clahe_grid=(8, 8),
-                 gamma_target=0.5,
-                 canny_min=50,
-                 canny_max=150,
-                 morph_kernel_size=5,
-                 min_contour_area=1000,
-                 approx_poly_epsilon_ratio=0.02,
-                 max_good_features=20,
-                 good_feature_quality=0.01,
-                 good_feature_min_dist=20,
-                 block_size_adaptive_thresh=11,
-                 c_adaptive_thresh=2):
-        self.clahe_clip = clahe_clip
-        self.clahe_grid = clahe_grid
-        self.gamma_target = gamma_target
-        self.canny_min = canny_min
-        self.canny_max = canny_max
-        self.morph_kernel_size = morph_kernel_size
-        self.min_contour_area = min_contour_area
-        self.approx_poly_epsilon_ratio = approx_poly_epsilon_ratio
-        self.max_good_features = max_good_features
-        self.good_feature_quality = good_feature_quality
-        self.good_feature_min_dist = good_feature_min_dist
-        self.block_size_adaptive_thresh = block_size_adaptive_thresh
-        self.c_adaptive_thresh = c_adaptive_thresh
-
-
-def analyze_brightness(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return gray.mean() / 255.0  # 0-1 arası parlaklık
-
-
-def adaptive_gamma(img, params: Params):
-    brightness = analyze_brightness(img)
-    if brightness < 0.3:
-        return min(3.0, params.gamma_target * 2.0)
-    elif brightness > 0.7:
-        return max(0.3, params.gamma_target * 0.6)
-    else:
-        return params.gamma_target
-
-
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]  # top-left
     rect[2] = pts[np.argmax(s)]  # bottom-right
+
     diff = np.diff(pts, axis=1)
     rect[1] = pts[np.argmin(diff)]  # top-right
     rect[3] = pts[np.argmax(diff)]  # bottom-left
     return rect
 
 
-def preprocess(img, params: Params):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=params.clahe_clip, tileGridSize=params.clahe_grid)
-    enhanced = clahe.apply(gray)
+def correct_perspective(image, params=None):
+    # 1. Ön işleme
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    gray = cv2.equalizeHist(gray)
 
-    gamma_val = adaptive_gamma(img, params)
-    table = np.array([(i / 255.0) ** (1.0 / gamma_val) * 255 for i in range(256)]).astype(np.uint8)
-    gamma_corrected = cv2.LUT(enhanced, table)
+    # 2. Kenar tespiti
+    edges = cv2.Canny(gray, 50, 150)
+    edges = cv2.dilate(edges, None, iterations=2)
+    edges = cv2.erode(edges, None, iterations=1)
 
-    blurred = cv2.GaussianBlur(gamma_corrected, (5, 5), 0)
-    return blurred
+    # 3. Hough ile çizgi tespiti
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=50, maxLineGap=10)
+    line_img = np.zeros_like(edges)
+    if lines is not None:
+        for l in lines:
+            x1, y1, x2, y2 = l[0]
+            cv2.line(line_img, (x1, y1), (x2, y2), 255, 2)
 
+    # 4. Çizgilerden kontur bulma
+    contours, _ = cv2.findContours(line_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    biggest = None
+    max_area = 0
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        area = cv2.contourArea(approx)
+        if len(approx) == 4 and area > max_area:
+            biggest = approx
+            max_area = area
 
-def angle(pt1, pt2, pt3):
-    v1 = pt1 - pt2
-    v2 = pt3 - pt2
-    cos_theta = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-    ang = np.arccos(np.clip(cos_theta, -1.0, 1.0))
-    return np.degrees(ang)
+    if biggest is None:
+        return image  # belge bulunamazsa orijinal dön
 
-
-def is_contour_convex_and_angles_good(pts):
-    pts = pts.reshape(4, 2)
-    if not cv2.isContourConvex(pts):
-        return False
-    for i in range(4):
-        p1 = pts[i]
-        p2 = pts[(i + 1) % 4]
-        p3 = pts[(i + 2) % 4]
-        ang = angle(p1, p2, p3)
-        if ang < 50 or ang > 130:
-            return False
-    return True
-
-
-def detect_corners(img, params: Params):
-    # Önce Shi-Tomasi köşe tespiti dene
-    corners = cv2.goodFeaturesToTrack(img,
-                                      maxCorners=params.max_good_features,
-                                      qualityLevel=params.good_feature_quality,
-                                      minDistance=params.good_feature_min_dist)
-
-    if corners is not None and len(corners) >= 4:
-        corners = np.squeeze(corners)
-        if len(corners) > 4:
-            center = corners.mean(axis=0)
-            dists = np.linalg.norm(corners - center, axis=1)
-            idxs = np.argsort(dists)[-4:]
-            corners = corners[idxs]
-        return order_points(corners)
-    else:
-        # Shi-Tomasi başarısızsa kontur tabanlı tespit
-        contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        for cnt in contours:
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, params.approx_poly_epsilon_ratio * peri, True)
-            if len(approx) == 4 and cv2.contourArea(approx) > params.min_contour_area:
-                if is_contour_convex_and_angles_good(approx):
-                    return order_points(approx.reshape(4, 2))
-        return None
-
-
-def four_point_transform(img, pts):
+    # 5. Köşeleri sırala
+    pts = biggest.reshape(4, 2)
     rect = order_points(pts)
+
+    # 6. Perspektif dönüşümü
     (tl, tr, br, bl) = rect
     widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
     maxWidth = int(max(widthA, widthB))
+
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxHeight = int(max(heightA, heightB))
+
     dst = np.array([
         [0, 0],
         [maxWidth - 1, 0],
         [maxWidth - 1, maxHeight - 1],
         [0, maxHeight - 1]
     ], dtype="float32")
+
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+
     return warped
 
 
-def correct_perspective(img, params: Params):
-    pre = preprocess(img, params)
-
-    thresh = cv2.adaptiveThreshold(pre, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY_INV, params.block_size_adaptive_thresh, params.c_adaptive_thresh)
-    edges = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((params.morph_kernel_size, params.morph_kernel_size), np.uint8))
-
-    corners = detect_corners(edges, params)
-
-    if corners is None:
-        edges = cv2.Canny(pre, params.canny_min, params.canny_max)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((params.morph_kernel_size, params.morph_kernel_size), np.uint8))
-        corners = detect_corners(edges, params)
-
-    if corners is None:
-        raise ValueError("Belge köşeleri bulunamadı.")
-
-    warped = four_point_transform(img, corners)
-    return PILImage.fromarray(warped)
-
-
 class PerspectiveCorrection(Component):
-    def __init__(self, request, bootstrap):
-        super().__init__(request, bootstrap)
-        self.request.model = PackageModel(**(self.request.data))
-        self.image = self.request.get_param("inputImage")
-        params_data = self.request.get_param("params", None)
-        if params_data is not None:
-            self.params = Params(**params_data)
-        else:
-            self.params = Params()
-
-    @staticmethod
-    def bootstrap(config: dict) -> dict:
-        return {}
-
     def run(self):
         img = Image.get_frame(img=self.image, redis_db=self.redis_db)
         img_np = img.value

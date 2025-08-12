@@ -3,187 +3,141 @@ import sys
 import cv2
 import numpy as np
 
-# sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../')) # Removed this line
+sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
-from components.PerspectiveCorrection.src.utils.response import build_response
-from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
+from components.PerspectiveTransformation.src.utils.response import build_response
+from components.PerspectiveTransformation.src.models.PackageModel import PackageModel
 
 
-def order_points(pts: np.ndarray) -> np.ndarray:
+
+def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # top-left
-    rect[2] = pts[np.argmax(s)]  # bottom-right
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
     return rect
 
-def find_intersections(lines):
-    """Finds intersection points from a set of lines."""
-    intersections = []
-    for i in range(len(lines)):
-        for j in range(i + 1, len(lines)):
-            line1 = lines[i][0]
-            line2 = lines[j][0]
 
-            rho1, theta1 = line1
-            rho2, theta2 = line2
+def correct_perspective_advanced(image, params=None):
+    gray_orig = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-            A = np.array([
-                [np.cos(theta1), np.sin(theta1)],
-                [np.cos(theta2), np.sin(theta2)]
-            ])
-            b = np.array([[rho1], [rho2]])
+    def clahe(img):
+        clahe_obj = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        return clahe_obj.apply(img)
 
-            det = np.linalg.det(A)
-            if det == 0:
-                continue # Parallel lines
+    def unsharp_mask(img):
+        gaussian = cv2.GaussianBlur(img, (9, 9), 10.0)
+        return cv2.addWeighted(img, 1.5, gaussian, -0.5, 0)
 
-            x, y = np.linalg.solve(A, b)
-            intersections.append((x[0], y[0]))
-    return np.array(intersections)
+    def preprocess_variants(img):
+        variants = []
 
-def filter_and_select_corners(intersections, image_shape, quad_approx, tolerance=20):
-    """Filters intersection points to find the four corners closest to the initial approximation."""
-    h, w = image_shape[:2]
-    corners = []
-    for approx_point in quad_approx.reshape(4, 2):
-        distances = np.linalg.norm(intersections - approx_point, axis=1)
-        closest_intersection_index = np.argmin(distances)
-        closest_intersection = intersections[closest_intersection_index]
+        v1 = clahe(img)
+        edges1 = cv2.Canny(v1, 50, 150)
+        variants.append(("normal", edges1))
 
-        # Add a tolerance check to ensure the intersection is reasonably close
-        if distances[closest_intersection_index] < tolerance:
-             corners.append(closest_intersection)
+        v2 = unsharp_mask(clahe(img))
+        edges2 = cv2.Canny(v2, 50, 150)
+        variants.append(("agresif", edges2))
 
-    # If we didn't find 4 corners, return None
-    if len(corners) != 4:
-        return None
+        v3 = cv2.GaussianBlur(img, (5, 5), 0)
+        thr = cv2.adaptiveThreshold(v3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 11, 2)
+        variants.append(("yumusak", thr))
 
-    return np.array(corners, dtype="float32")
+        return variants
 
+    def validate_contour(cnt, edges, img_shape):
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) != 4:
+            return None
 
+        if not cv2.isContourConvex(approx):
+            return None
 
-# -----------------------------
-# Mükemmel Perspektif Düzeltme (Kenar Kesişimi Tabanlı)
-# -----------------------------
-def correct_perspective_advanced(image: np.ndarray, params: dict = None) -> np.ndarray:
-    """
-    Kenar kesişimi tabanlı perspektif düzeltme.
-    params (opsiyonel): {
-      "canny_low_threshold": 50,
-      "canny_high_threshold": 150,
-      "hough_rho": 1,
-      "hough_theta": np.pi / 180,
-      "hough_threshold": 100,
-      "intersection_tolerance": 20,
-      "min_area_ratio": 0.01,
-      "max_area_ratio": 0.95,
-      "corner_subpix_win": (5,5),
-      "corner_subpix_iter": 40
-    }
-    """
-    # ---------- params ----------
-    if params is None:
-        params = {}
-    CANNY_LOW = params.get("canny_low_threshold", 50)
-    CANNY_HIGH = params.get("canny_high_threshold", 150)
-    HOUGH_RHO = params.get("hough_rho", 1)
-    HOUGH_THETA = params.get("hough_theta", np.pi / 180)
-    HOUGH_THRESHOLD = params.get("hough_threshold", 100)
-    INTERSECTION_TOLERANCE = params.get("intersection_tolerance", 20)
-    MIN_AREA_RATIO = params.get("min_area_ratio", 0.01)
-    MAX_AREA_RATIO = params.get("max_area_ratio", 0.95)
-    SUBPIX_WIN = params.get("corner_subpix_win", (5, 5))
-    SUBPIX_ITERS = params.get("corner_subpix_iter", 40)
+        area = cv2.contourArea(approx)
+        h, w = img_shape[:2]
+        if area < 0.01 * w * h or area > 0.9 * w * h:
+            return None
 
+        pts = approx.reshape(4, 2)
+        widths = [np.linalg.norm(pts[i] - pts[(i+1) % 4]) for i in range(4)]
+        min_w, max_w = min(widths), max(widths)
+        if min_w / max_w < 0.2:
+            return None
 
-    # ---------- Preprocessing ----------
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
+        mask = np.zeros_like(edges)
+        cv2.drawContours(mask, [approx], -1, 255, 2)
+        overlap = cv2.countNonZero(cv2.bitwise_and(mask, edges))
+        total_edge = cv2.countNonZero(mask)
+        if total_edge == 0 or (overlap / total_edge) < 0.7:
+            return None
 
-    # ---------- Find Lines (Hough Transform) ----------
-    lines = cv2.HoughLines(edges, HOUGH_RHO, HOUGH_THETA, HOUGH_THRESHOLD)
+        return approx
 
-    if lines is None:
-        # Fallback to original image if no lines are found
+    def score_contour(cnt, img_shape):
+        pts = cnt.reshape(4, 2)
+        h, w = img_shape[:2]
+        center = np.array([w/2, h/2])
+
+        area = cv2.contourArea(cnt)
+        area_score = 1 - abs(area - 0.25*w*h) / (0.25*w*h)
+
+        widths = [np.linalg.norm(pts[i] - pts[(i+1)%4]) for i in range(4)]
+        height_diff = abs(widths[0] - widths[2]) / max(widths[0], widths[2])
+        width_diff = abs(widths[1] - widths[3]) / max(widths[1], widths[3])
+        rect_score = 1 - (height_diff + width_diff) / 2
+
+        cnt_center = np.mean(pts, axis=0)
+        dist_center = np.linalg.norm(cnt_center - center)
+        max_dist = np.linalg.norm(np.array([w/2, h/2]))
+        center_score = 1 - (dist_center / max_dist)
+
+        return area_score + rect_score + center_score
+
+    variants = preprocess_variants(gray_orig)
+    candidates = []
+
+    for name, processed in variants:
+        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            valid = validate_contour(cnt, processed, image.shape)
+            if valid is not None:
+                score = score_contour(valid, image.shape)
+                candidates.append((score, valid))
+
+    if not candidates:
+
+        thr = cv2.threshold(gray_orig, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            biggest = max(contours, key=cv2.contourArea)
+            peri = cv2.arcLength(biggest, True)
+            approx = cv2.approxPolyDP(biggest, 0.02 * peri, True)
+            if len(approx) == 4:
+                candidates.append((0, approx))
+
+    if not candidates:
         return image
 
-    # ---------- Find Intersections ----------
-    intersections = find_intersections(lines)
+    best = max(candidates, key=lambda x: x[0])[1]
+    rect = order_points(best.reshape(4, 2))
 
-    if intersections.size == 0:
-         # Fallback to original image if no intersections are found
-         return image
-
-    # ---------- Initial Quad Approximation (using contours as a hint) ----------
-    # This helps guide the intersection filtering
-    contours, _ = cv2.findContours(edges.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    quad_approx = None
-    if contours:
-        # Find the largest contour and approximate a polygon
-        largest_contour = max(contours, key=cv2.contourArea)
-        peri = cv2.arcLength(largest_contour, True)
-        approx = cv2.approxPolyDP(largest_contour, 0.02 * peri, True)
-        if len(approx) == 4:
-            quad_approx = approx
-
-    if quad_approx is None:
-        # If contour approximation failed, use image corners as a very rough hint
-        h, w = image.shape[:2]
-        quad_approx = np.array([[0,0],[w,0],[w,h],[0,h]], dtype=np.float32).reshape(4,1,2)
-
-
-    # ---------- Filter and Select Corners from Intersections ----------
-    corners = filter_and_select_corners(intersections, image.shape, quad_approx, INTERSECTION_TOLERANCE)
-
-    if corners is None:
-        # Fallback if filtering didn't yield 4 corners
-        return image
-
-    # ---------- Refine Corners (Subpixel) ----------
-    corners = corners.reshape(-1, 1, 2).astype(np.float32)
-    term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, SUBPIX_ITERS, 0.01)
-    try:
-        cv2.cornerSubPix(gray, corners, SUBPIX_WIN, (-1,-1), term)
-    except Exception:
-        # fallback: skip subpix if it fails
-        pass
-    corners = corners.reshape(4,2)
-
-    # ---------- Order Points ----------
-    rect = order_points(corners)
-
-    # ---------- Validate Geometry (Optional but Recommended) ----------
-    # You can add checks here for angle consistency, aspect ratio, etc.
-    # For now, we rely on the intersection filtering and subpixel refinement.
-    # You might add:
-    # - Check if the area of the found quad is within reasonable bounds
-    # - Check if angles are close to 90 degrees
-
-    # Check area bounds on full-res
-    full_h, full_w = gray.shape[:2]
-    full_area = cv2.contourArea(rect.reshape(4,1,2))
-    if full_area < (MIN_AREA_RATIO * full_w * full_h) or full_area > (MAX_AREA_RATIO * full_w * full_h):
-        # Fallback if the found area is too small or too large
-        return image
-
-    # ---------- Warp Perspective ----------
     (tl, tr, br, bl) = rect
     widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(round(max(widthA, widthB)))
+    maxWidth = int(max(widthA, widthB))
+
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(round(max(heightA, heightB)))
-
-    if maxWidth < 10 or maxHeight < 10:
-        return image # Prevent tiny outputs
+    maxHeight = int(max(heightA, heightB))
 
     dst = np.array([
         [0, 0],
@@ -193,17 +147,10 @@ def correct_perspective_advanced(image: np.ndarray, params: dict = None) -> np.n
     ], dtype="float32")
 
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
-
-    # Store the found corners in context for potential debugging/visualization
-    try:
-        # Convert corners to a serializable format if needed for context
-        self.context["src_quad"] = rect.tolist()
-    except Exception:
-        pass
-
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
     return warped
+
 
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -211,47 +158,23 @@ class PerspectiveCorrection(Component):
         self.request.model = PackageModel(**(self.request.data))
         self.image = self.request.get_param("inputImage")
         self.params = self.request.get_param("params", None)
-        self.context = {} # Initialize context here
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
         return {}
 
-    def _prepare_image(self, img):
-        if img is None or img.size == 0:
-            raise ValueError("Input image is empty or None.")
-        if img.dtype != np.uint8:
-
-            if img.max() <= 1.0 and np.issubdtype(img.dtype, np.floating):
-                 img = (img * 255).astype(np.uint8)
-            else:
-
-                 img = img.astype(np.uint8)
-
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[-1] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        return img
-
     def run(self):
-        img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
-        if img_obj is None or img_obj.value is None:
-            raise ValueError("No input image provided or failed to load.")
+        img = Image.get_frame(img=self.image, redis_db=self.redis_db)
+        img_np = img.value
+        if img_np.dtype != np.uint8:
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).astype(np.uint8)
+            else:
+                img_np = img_np.astype(np.uint8)
 
-        src = self._prepare_image(img_obj.value)
-
-        warped = correct_perspective_advanced(src, self.params)
-
-        img_obj.value = warped
-        self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
-
-        try:
-             self.context["output_size"] = [warped.shape[1], warped.shape[0]]
-        except Exception:
-             pass
-
-
+        result_img = correct_perspective_advanced(img_np, self.params)
+        img.value = np.array(result_img)
+        self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
         return build_response(context=self)
 
 

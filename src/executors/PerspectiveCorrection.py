@@ -3,6 +3,7 @@ import sys
 import cv2
 import numpy as np
 from typing import List, Dict
+from scipy.spatial import distance
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -11,7 +12,6 @@ from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
 from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
-from scipy.spatial import distance
 
 
 # ----------------------------
@@ -39,7 +39,8 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxHeight = int(round(max(heightA, heightB)))
-    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype=np.float32)
+    dst = np.array([[0, 0], [maxWidth - 1, 0],
+                    [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
     return warped
@@ -74,6 +75,10 @@ def adaptive_contrast_enhancement(image: np.ndarray, clip_limit=None) -> np.ndar
     return gamma_correction(img_clahe, gamma_val)
 
 
+# ----------------------------
+# Ön İşleme Varyantları
+# ----------------------------
+
 def preprocess_variants(img: np.ndarray, params: Dict = None) -> List[Dict]:
     variants = []
     if params is None: params = {}
@@ -103,7 +108,7 @@ def preprocess_variants(img: np.ndarray, params: Dict = None) -> List[Dict]:
                                     cv2.THRESH_BINARY, 11, 2)
         variants.append({"name": f"yumusak_{k[0]}", "edges": thr})
 
-    # 4️⃣ Gamma Correction + CLAHE + Canny
+    # 4️⃣ Gamma + CLAHE + Canny
     for g in gamma_values:
         gamma_img = np.array(np.power(clahe_img / 255.0, g) * 255, dtype=np.uint8)
         for low, high in canny_thresholds:
@@ -118,6 +123,10 @@ def preprocess_variants(img: np.ndarray, params: Dict = None) -> List[Dict]:
 
     return variants
 
+
+# ----------------------------
+# Köşe Tespiti
+# ----------------------------
 
 def find_corners_from_edges(edges: np.ndarray) -> np.ndarray:
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80, minLineLength=30, maxLineGap=10)
@@ -173,6 +182,10 @@ def select_best_quad(image: np.ndarray, candidate_quads: List[np.ndarray]) -> np
             best_quad = quad
     return best_quad
 
+
+# ----------------------------
+# Perspektif Düzeltme
+# ----------------------------
 
 def correct_perspective_advanced(img: np.ndarray, params: Dict = None) -> np.ndarray:
     variants = preprocess_variants(img, params)

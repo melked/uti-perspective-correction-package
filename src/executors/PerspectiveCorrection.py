@@ -43,23 +43,28 @@ def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     return np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
 
-def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_area_ratio=0.05) -> np.ndarray:
-    if binary_img.dtype != np.uint8:
-        binary_img = cv2.normalize(binary_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_area_ratio=0.05, max_area_ratio=0.95) -> np.ndarray:
     contours, _ = cv2.findContours(binary_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return _full_image_quad(ref_image)
+
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
     img_area = ref_image.shape[0] * ref_image.shape[1]
     min_area = img_area * min_area_ratio
+    max_area = img_area * max_area_ratio  # Çok büyük alanı sınırlıyoruz
+
     for c in contours:
-        if cv2.contourArea(c) < min_area:
+        area = cv2.contourArea(c)
+        if area < min_area or area > max_area:
             continue
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02*peri, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
-            return approx.reshape(4,2).astype(np.float32)
+            return approx.reshape(4, 2).astype(np.float32)
+
+    # Hiç uygun kontur yoksa tüm görseli döndür
     return _full_image_quad(ref_image)
+
 
 def _unsharp_mask(image, ksize=(5,5), strength=1.5):
     blur = cv2.GaussianBlur(image, ksize, 0)

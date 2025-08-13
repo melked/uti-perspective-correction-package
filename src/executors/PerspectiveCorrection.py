@@ -13,7 +13,8 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 # ------------------------------
-# Yardımcı fonksiyonlar
+# Yardımcı Fonksiyonlar
+
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype=np.float32)
@@ -24,6 +25,7 @@ def _order_points(pts: np.ndarray) -> np.ndarray:
     rect[1] = pts[np.argmin(diff)]
     rect[3] = pts[np.argmax(diff)]
     return rect
+
 
 def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     rect = _order_points(pts)
@@ -38,85 +40,94 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
+
 def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     return np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
+
 
 def _unsharp_mask(image, ksize=(5,5), strength=1.5):
     blur = cv2.GaussianBlur(image, ksize, 0)
     return cv2.addWeighted(image, 1+strength, blur, -strength, 0)
 
+
 def _gamma_correction(image: np.ndarray, gamma=1.5) -> np.ndarray:
     invGamma = 1.0 / gamma
-    table = np.array([(i/255.0)**invGamma * 255 for i in np.arange(256)]).astype("uint8")
+    table = np.array([(i/255.0)**invGamma*255 for i in range(256)]).astype('uint8')
     return cv2.LUT(image, table)
 
 # ------------------------------
-# Ön işleme: Black/Top Hat + CLAHE + Sharpen
-def _preprocess_for_edges(image: np.ndarray) -> np.ndarray:
-    # Gürültü azaltma ve kenar koruma
-    bilateral = cv2.bilateralFilter(image, 9, 75, 75)
+# Hough Lines & Intersection
 
-    # CLAHE kontrast iyileştirme
-    lab = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    L = clahe.apply(L)
-    lab_clahe = cv2.merge((L,A,B))
-    img_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
-
-    # Keskinlik artırma
-    sharpened = _unsharp_mask(img_clahe)
-
-    # Black-hat ve Top-hat morfoloji
-    gray = cv2.cvtColor(sharpened, cv2.COLOR_BGR2GRAY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15,15))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-    combined = cv2.add(gray, tophat)
-    combined = cv2.subtract(combined, blackhat)
-
-    # Canny ile kenar tespiti
-    edges = cv2.Canny(combined, 50, 150)
-    return edges
+def _line_intersection(l1, l2):
+    x1, y1, x2, y2 = map(np.float64, l1)
+    x3, y3, x4, y4 = map(np.float64, l2)
+    denom = (x1 - x2)*(y3 - y4) - (y1 - y2)*(x3 - x4)
+    if np.abs(denom) < 1e-6:
+        return None
+    px = ((x1*y2 - y1*x2)*(x3 - x4) - (x1 - x2)*(x3*y4 - y3*x4)) / denom
+    py = ((x1*y2 - y1*x2)*(y3 - y4) - (y1 - y2)*(x3*y4 - y3*x4)) / denom
+    return [px, py]
 
 # ------------------------------
-# HoughLines kesişimi ile quad bulma (overflow düzeltilmiş)
-def _hough_quad(edges: np.ndarray, ref_image: np.ndarray) -> np.ndarray:
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=50, maxLineGap=15)
-    if lines is None or len(lines)<4:
-        return _full_image_quad(ref_image)
+# Adaptive Preprocessing
 
+def _preprocess_black_top_hat(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Black hat (karanlık çizgiler öne çıkar)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15,15))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    # Top hat (aydınlık çizgiler öne çıkar)
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    combined = cv2.addWeighted(blackhat, 0.5, tophat, 0.5, 0)
+    # Bilateral filter + Unsharp
+    filtered = cv2.bilateralFilter(combined, 9, 75, 75)
+    sharpened = _unsharp_mask(filtered)
+    # Normalize
+    return cv2.normalize(sharpened, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+# ------------------------------
+# Detect Document using Hough + Intersections
+
+def _detect_document_quad(image: np.ndarray) -> np.ndarray:
+    preprocessed = _preprocess_black_top_hat(image)
+    edges = cv2.Canny(preprocessed, 50, 150)
+
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=50, maxLineGap=10)
+    if lines is None or len(lines) < 4:
+        return _full_image_quad(image)
+
+    # Toleranslı açı filtrelemesi
+    filtered = []
+    for line in lines:
+        x1,y1,x2,y2 = line[0]
+        angle = np.degrees(np.arctan2(y2-y1, x2-x1)) % 180
+        if abs(angle-0)<15 or abs(angle-90)<15 or abs(angle-180)<15:
+            filtered.append(line)
+    lines = np.array(filtered) if filtered else None
+
+    if lines is None or len(lines)<4:
+        return _full_image_quad(image)
+
+    # Kesişim noktalarını bul
     points = []
     for i in range(len(lines)):
         for j in range(i+1, len(lines)):
-            x1, y1, x2, y2 = lines[i][0].astype(np.float64)
-            x3, y3, x4, y4 = lines[j][0].astype(np.float64)
-            denom = (x1-x2)*(y3-y4) - (y1-y2)*(x3-x4)
-            if denom == 0:
-                continue
-            px = ((x1*y2 - y1*x2)*(x3-x4) - (x1-x2)*(x3*y4 - y3*x4)) / denom
-            py = ((x1*y2 - y1*x2)*(y3-y4) - (y1-y2)*(x3*y4 - y3*x4)) / denom
-            if 0<=px<ref_image.shape[1] and 0<=py<ref_image.shape[0]:
-                points.append([px, py])
+            inter = _line_intersection(lines[i][0], lines[j][0])
+            if inter is not None:
+                points.append(inter)
+    if len(points) < 4:
+        return _full_image_quad(image)
 
-    if len(points)<4:
-        return _full_image_quad(ref_image)
-
-    hull = cv2.convexHull(np.array(points, dtype=np.float32))
-    if len(hull)<4:
-        return _full_image_quad(ref_image)
+    points = np.array(points, dtype=np.float32)
+    hull = cv2.convexHull(points)
+    if len(hull) < 4:
+        return _full_image_quad(image)
     return hull[:4].reshape(4,2)
 
 # ------------------------------
-# Ana belge tespiti
-def detect_document(image: np.ndarray) -> np.ndarray:
-    edges = _preprocess_for_edges(image)
-    quad = _hough_quad(edges, image)
-    return quad
+# Executor Sınıfı
 
-# ------------------------------
-# Executor sınıfı
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
@@ -130,11 +141,11 @@ class PerspectiveCorrection(Component):
         return {}
 
     def _prepare_image(self, img: np.ndarray) -> np.ndarray:
-        if img is None or img.size == 0:
+        if img is None or img.size==0:
             raise ValueError("Input image is empty or None.")
         if img.dtype != np.uint8:
             img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        if img.ndim == 2:
+        if img.ndim==2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif img.shape[-1]==4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
@@ -146,7 +157,7 @@ class PerspectiveCorrection(Component):
             raise ValueError("No input image provided or failed to load.")
 
         src_img = self._prepare_image(img_obj.value)
-        best_quad = detect_document(src_img)
+        best_quad = _detect_document_quad(src_img)
         warped = _four_point_transform(src_img, best_quad)
 
         img_obj.value = warped

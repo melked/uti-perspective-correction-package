@@ -39,7 +39,7 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
                     [maxWidth - 1, maxHeight - 1],
                     [0, maxHeight - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.wwarpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+    return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]

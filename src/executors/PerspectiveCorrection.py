@@ -125,26 +125,53 @@ def find_corners_from_edges(edges):
     return points[idxs]
 
 def correct_perspective_advanced(image, params=None):
-    gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     variants = preprocess_variants(gray)
     best_rect = None
     max_score = -1
-    for name,edges in variants:
+    w = h = 0
+
+    for name, edges in variants:
         corners = find_corners_from_edges(edges)
-        if corners is None: continue
-        # Basit scoring: alan + merkeze yakınlık
-        tl,tr,br,bl = order_points(corners)
-        w = int(max(np.linalg.norm(br-bl),np.linalg.norm(tr-tl)))
-        h = int(max(np.linalg.norm(tr-br),np.linalg.norm(tl-bl)))
-        score = w*h - abs(np.mean(corners[:,0])-gray.shape[1]/2) - abs(np.mean(corners[:,1])-gray.shape[0]/2)
-        if score>max_score:
-            max_score=score
-            best_rect = np.array([tl,tr,br,bl],dtype=np.float32)
+
+        if corners is None:
+            # fallback: kontur tabanlı dörtgen
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                biggest = max(contours, key=cv2.contourArea)
+                peri = cv2.arcLength(biggest, True)
+                approx = cv2.approxPolyDP(biggest, 0.02*peri, True)
+                if len(approx) == 4:
+                    corners = approx.reshape(4, 2)
+
+        if corners is None:
+            continue
+
+        tl, tr, br, bl = order_points(corners)
+        w_curr = int(max(np.linalg.norm(br-bl), np.linalg.norm(tr-tl)))
+        h_curr = int(max(np.linalg.norm(tr-br), np.linalg.norm(tl-bl)))
+
+        # dikdörtgen oranı
+        ratio = min(w_curr,h_curr)/max(w_curr,h_curr)
+        # merkez puanı
+        cx, cy = np.mean(corners, axis=0)
+        center_score = 1 - (abs(cx - gray.shape[1]/2)/gray.shape[1] + abs(cy - gray.shape[0]/2)/gray.shape[0])/2
+
+        score = w_curr*h_curr*ratio*center_score
+
+        if score > max_score:
+            max_score = score
+            best_rect = np.array([tl, tr, br, bl], dtype=np.float32)
+            w, h = w_curr, h_curr
+
+    # fallback: hiçbir şey bulunamazsa bounding box
     if best_rect is None:
-        return image
-    dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]],dtype=np.float32)
-    M = cv2.getPerspectiveTransform(best_rect,dst)
-    warped = cv2.warpPerspective(image,M,(w,h))
+        x, y, w, h = cv2.boundingRect(cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1])
+        best_rect = np.array([[x,y],[x+w,y],[x+w,y+h],[x,y+h]], dtype=np.float32)
+
+    dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(best_rect, dst)
+    warped = cv2.warpPerspective(image, M, (w,h))
     return warped
 
 class PerspectiveCorrection(Component):

@@ -9,8 +9,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
-from components.PerspectiveTransformation.src.utils.response import build_response
-from components.PerspectiveTransformation.src.models.PackageModel import PackageModel
+from components.PerspectiveCorrection.src.utils.response import build_response
+from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 # ---------------- Utility Functions ---------------- #
 
@@ -183,7 +183,7 @@ def select_best_quad(image: np.ndarray, candidates: List[np.ndarray]) -> np.ndar
 
 # ---------------- Component ---------------- #
 
-class PerspectiveTransformation(Component):
+class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}

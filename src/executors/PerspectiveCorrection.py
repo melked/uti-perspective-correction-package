@@ -2,15 +2,15 @@ import os
 import sys
 import cv2
 import numpy as np
-from typing import List
+from typing import List, Callable
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
-from components.PerspectiveCorrection.src.utils.response import build_response
-from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
+from components.PerspectiveTransformation.src.utils.response import build_response
+from components.PerspectiveTransformation.src.models.PackageModel import PackageModel
 
 
 # -------------------- Helper Functions --------------------
@@ -92,7 +92,6 @@ def adaptive_contrast(image: np.ndarray) -> np.ndarray:
     clip_limit = 2.0 if np.mean(L) < 100 else 3.0
     L = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8)).apply(L)
     img = cv2.cvtColor(cv2.merge((L, A, B)), cv2.COLOR_LAB2BGR)
-    # Adaptif gamma
     mean_gray = np.mean(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
     if mean_gray < 80: gamma = 1.8
     elif mean_gray > 180: gamma = 0.6
@@ -116,7 +115,8 @@ def detect_lab_range(image: np.ndarray) -> np.ndarray:
     L, A, B = cv2.split(lab)
     mask = cv2.inRange(A, 130, 170) | cv2.inRange(B, 120, 160)
     L_blur = cv2.GaussianBlur(L, (5, 5), 0)
-    light_mask = cv2.adaptiveThreshold(L_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 5)
+    light_mask = cv2.adaptiveThreshold(L_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 15, 5)
     edges = cv2.Canny(L_blur, 40, 120)
     combined = cv2.bitwise_and(cv2.bitwise_or(light_mask, edges), cv2.bitwise_not(mask))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
@@ -126,9 +126,20 @@ def detect_lab_range(image: np.ndarray) -> np.ndarray:
 
 def detect_clahe_canny(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray), 50, 150)
+    clahe_img = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    edges = cv2.Canny(clahe_img, 50, 150)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     return cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+
+def detect_bright_blur(image: np.ndarray) -> np.ndarray:
+    img = gamma_correction(image, 1.8)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe_img = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    sharp = unsharp_mask(clahe_img)
+    edges = cv2.Canny(sharp, 30, 120)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    return cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
 def detect_hough(image: np.ndarray) -> np.ndarray:
@@ -137,26 +148,28 @@ def detect_hough(image: np.ndarray) -> np.ndarray:
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80, minLineLength=50, maxLineGap=10)
     if lines is None or len(lines) < 4:
         return full_image_quad(image)
-    points = np.vstack([lines[:,0,:2], lines[:,0,2:]])
+    points = np.vstack([lines[:, 0, :2], lines[:, 0, 2:]])
     x_min, y_min = np.min(points, axis=0)
     x_max, y_max = np.max(points, axis=0)
     return np.array([[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]], dtype=np.float32)
 
 
-# -------------------- Candidate Selection --------------------
+# -------------------- Candidate Detection --------------------
 
 def detect_document_candidates(image: np.ndarray) -> List[np.ndarray]:
     img = adaptive_contrast(image)
     img = preprocess_for_edges(img)
 
-    detectors = [
+    pipelines: List[Callable[[np.ndarray], np.ndarray]] = [
         lambda img: find_quad_from_contours(detect_lab_range(img), img),
         lambda img: find_quad_from_contours(detect_clahe_canny(img), img),
+        lambda img: find_quad_from_contours(detect_bright_blur(img), img),
         detect_hough
+        # Buraya diğer pipeline’ları ekleyebilirsin: mask_background_complex, dark_object, gradient_magnitude vb.
     ]
 
     candidates = []
-    for detector in detectors:
+    for detector in pipelines:
         try:
             quad = detector(img)
             if not np.allclose(quad, full_image_quad(image), atol=1):
@@ -166,18 +179,32 @@ def detect_document_candidates(image: np.ndarray) -> List[np.ndarray]:
 
     if not candidates:
         candidates.append(full_image_quad(image))
-
     return candidates
 
 
+def score_quad(image: np.ndarray, quad: np.ndarray) -> float:
+    # Basit scoring: alan oranı + kenar yoğunluğu
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.fillConvexPoly(mask, quad.astype(np.int32), 255)
+    edge_density = np.sum(cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 50, 150) & mask) / 255
+    area_score = cv2.contourArea(quad.astype(np.int32))
+    return edge_density * 0.7 + area_score * 0.3
+
+
 def select_best_quad(image: np.ndarray, candidates: List[np.ndarray]) -> np.ndarray:
-    # Placeholder scoring; burada gelişmiş scoring algoritması ekleyebilirsin
-    return candidates[0]
+    best_quad = full_image_quad(image)
+    best_score = -1
+    for quad in candidates:
+        s = score_quad(image, quad)
+        if s > best_score:
+            best_score = s
+            best_quad = quad
+    return best_quad
 
 
 # -------------------- Component --------------------
 
-class PerspectiveCorrection(Component):
+class PerspectiveTransformation(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}
@@ -205,6 +232,7 @@ class PerspectiveCorrection(Component):
             raise ValueError("No input image provided or failed to load.")
 
         src_img = self._prepare_image(img_obj.value)
+
         candidates = detect_document_candidates(src_img)
         best_quad = select_best_quad(src_img, candidates)
         warped = four_point_transform(src_img, best_quad)

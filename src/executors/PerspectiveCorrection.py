@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import numpy as np
+from scipy.spatial import distance
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -68,7 +69,7 @@ def preprocess_variants(img):
     # 6️⃣ Morph Gradient
     for size in [3,5]:
         v = clahe_fn(2.0)
-        morph = cv2.morphologyEx(v,cv2.MORPH_GRADIENT,np.ones((size,size),np.uint8))
+        morph = cv2.morphologyEx(v,cv2.MORPH_GRADIENT,np.ones((size,size),np.uint8)) #bu güzel bişiymiş.
         variants.append((f"morph_{size}",morph))
 
     # 7️⃣ Bilateral + Canny
@@ -96,9 +97,13 @@ def find_corners_from_edges(edges):
     for i,l1 in enumerate(lines):
         for j,l2 in enumerate(lines):
             if i>=j: continue
-            xdiff = np.array([l1[0][0]-l1[0][2], l2[0][0]-l2[0][2]])
-            ydiff = np.array([l1[0][1]-l1[0][3], l2[0][1]-l2[0][3]])
-            def det(a,b): return a[0]*b[1]-a[1]*b[0]
+            xdiff = np.array([l1[0][0] - l1[0][2], l2[0][0] - l2[0][2]], dtype=np.float64)
+            ydiff = np.array([l1[0][1] - l1[0][3], l2[0][1] - l2[0][3]], dtype=np.float64)
+
+            def det(a, b):
+                a = np.array(a, dtype=np.float64)
+                b = np.array(b, dtype=np.float64)
+                return a[0] * b[1] - a[1] * b[0]
             div = det(xdiff,ydiff)
             if div==0: continue
             d = (det([l1[0][0],l1[0][1]],[l1[0][2],l1[0][3]]),det([l2[0][0],l2[0][1]],[l2[0][2],l2[0][3]]))
@@ -113,7 +118,7 @@ def find_corners_from_edges(edges):
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1)
     cv2.cornerSubPix(edges,points,(5,5),(-1,-1),criteria)
     # 4 en iyi köşe seçimi (basit: en uzak 4 nokta)
-    from scipy.spatial import distance
+
     dists = distance.cdist(points,points)
     sumd = dists.sum(axis=1)
     idxs = np.argsort(sumd)[-4:]

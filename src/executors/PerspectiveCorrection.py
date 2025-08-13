@@ -146,30 +146,65 @@ def _auto_detect_document_corners_bright_blur(image: np.ndarray) -> np.ndarray:
 
 # ------------------------------
 # Kandidat tespit ve seçim
-def detect_document_candidates(image: np.ndarray) -> List[np.ndarray]:
+def detect_document_candidates_robust(image: np.ndarray) -> List[np.ndarray]:
+    """
+    Çoklu ön işleme ile olası belge köşelerini tespit eder.
+    """
     candidates = []
-    img_corrected = _adaptive_contrast_enhancement(image)
-    img_preprocessed = _preprocess_image_for_edges(img_corrected)
+    h, w = image.shape[:2]
 
-    variants = {
-        "sharpen_adaptive": _auto_detect_document_corners_sharpen_adaptive,
-        "bright_blur": _auto_detect_document_corners_bright_blur,
-        "clahe_canny": _auto_detect_document_corners_clahe_canny,
-        # Buraya diğer varyantları ekle
-    }
+    # --- 1️⃣ CLAHE + Canny ---
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    clahe_img = clahe.apply(gray)
+    edges1 = cv2.Canny(clahe_img, 50, 150)
+    candidates.append(_find_quad_from_contours(edges1, image, min_area_ratio=0.01))
 
-    for name, func in variants.items():
-        try:
-            quad = func(img_preprocessed)
-            if not np.allclose(quad, _full_image_quad(image), atol=1):
-                candidates.append(quad)
-        except Exception as e:
-            print(f"Error in {name} variant: {e}")
+    # --- 2️⃣ Bilateral + Unsharp + Canny ---
+    bilateral = cv2.bilateralFilter(image, 9, 75, 75)
+    lab = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
+    L, A, B = cv2.split(lab)
+    clahe_L = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(L)
+    lab_clahe = cv2.merge((clahe_L, A, B))
+    sharp = _unsharp_mask(cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR))
+    gray_sharp = cv2.cvtColor(sharp, cv2.COLOR_BGR2GRAY)
+    edges2 = cv2.Canny(gray_sharp, 50, 150)
+    candidates.append(_find_quad_from_contours(edges2, image, min_area_ratio=0.01))
 
-    if not candidates:
-        candidates.append(_full_image_quad(image))
+    # --- 3️⃣ Gamma + CLAHE + Canny ---
+    mean_gray = np.mean(gray)
+    gamma_val = 1.8 if mean_gray < 80 else (0.6 if mean_gray > 180 else 1.0)
+    gamma_img = _gamma_correction(image, gamma_val)
+    gray_gamma = cv2.cvtColor(gamma_img, cv2.COLOR_BGR2GRAY)
+    clahe_gamma = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(gray_gamma)
+    edges3 = cv2.Canny(clahe_gamma, 30, 120)
+    candidates.append(_find_quad_from_contours(edges3, image, min_area_ratio=0.01))
 
-    return candidates
+    # --- 4️⃣ Dark object detection (LAB + Canny) ---
+    L_lab, _, _ = cv2.split(cv2.cvtColor(image, cv2.COLOR_BGR2LAB))
+    _, dark_mask = cv2.threshold(L_lab, 80, 255, cv2.THRESH_BINARY_INV)
+    edges4 = cv2.Canny(dark_mask, 50, 150)
+    candidates.append(_find_quad_from_contours(edges4, image, min_area_ratio=0.01))
+
+    # --- 5️⃣ Color segmentation light areas (HSV) ---
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask_light = cv2.inRange(hsv, np.array([0,0,180]), np.array([180,30,255]))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
+    mask_light = cv2.morphologyEx(mask_light, cv2.MORPH_CLOSE, kernel)
+    mask_light = cv2.morphologyEx(mask_light, cv2.MORPH_OPEN, kernel)
+    candidates.append(_find_quad_from_contours(mask_light, image, min_area_ratio=0.01))
+
+    # Temizleme: sadece farklı köşeleri sakla
+    final_candidates = []
+    for c in candidates:
+        if not any(np.allclose(c, fc, atol=2) for fc in final_candidates):
+            final_candidates.append(c)
+
+    # En az bir candidate yoksa tüm resmi dön
+    if not final_candidates:
+        final_candidates.append(_full_image_quad(image))
+
+    return final_candidates
 
 
 def _score_quad(image: np.ndarray, quad: np.ndarray) -> float:
@@ -193,12 +228,10 @@ def select_best_quad(image: np.ndarray, candidates: List[np.ndarray]) -> np.ndar
     return best_quad
 
 
-# ------------------------------
-# Component sınıfı
-class PerspectiveCorrection(Component):
+class PerspectiveTransformation(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
-        self.context: Dict = {}
+        self.context = {}
         self.request.model = PackageModel(**(self.request.data))
         self.image = self.request.get_param("inputImage")
 
@@ -223,8 +256,14 @@ class PerspectiveCorrection(Component):
             raise ValueError("No input image provided or failed to load.")
 
         src_img = self._prepare_image(img_obj.value)
-        candidates = detect_document_candidates(src_img)
+
+        # Yeni robust köşe tespit pipeline'ını kullan
+        candidates = detect_document_candidates_robust(src_img)
+
+        # En iyi dörtgeni seç
         best_quad = select_best_quad(src_img, candidates)
+
+        # Perspektif dönüşüm uygula
         warped = _four_point_transform(src_img, best_quad)
 
         img_obj.value = warped
@@ -234,6 +273,5 @@ class PerspectiveCorrection(Component):
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
 
         return build_response(context=self)
-
 
 Executor(sys.argv[1]).run()

@@ -1,18 +1,17 @@
-import os
+
 import sys
+import os
 import cv2
 import numpy as np
 from typing import List
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
+
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
-from components.PerspectiveTransformation.src.utils.response import build_response
-from components.PerspectiveTransformation.src.models.PackageModel import PackageModel
-
-
-# ----------------------------
-# Temel Fonksiyonlar
-# ----------------------------
+from components.PerspectiveCorrection.src.utils.response import build_response
+from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -183,11 +182,15 @@ def select_best_quad(image: np.ndarray, candidates: List[np.ndarray]) -> np.ndar
 # Component
 # ----------------------------
 
-class PerspectiveTransformation(Component):
+class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}
-        self.request.model = PackageModel(**(self.request.data))
+
+        if not hasattr(self.request, "data") or not self.request.data:
+            raise ValueError("Request data is missing. Pass a valid 'data' dict with 'inputImage' key.")
+
+        self.request.model = PackageModel(**self.request.data)
         self.image = self.request.get_param("inputImage")
 
     @staticmethod
@@ -206,7 +209,12 @@ class PerspectiveTransformation(Component):
         return img
 
     def run(self):
-        img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
+        img_obj = None
+        try:
+            img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
+        except Exception as e:
+            raise ValueError(f"Failed to load image from Redis: {e}")
+
         if img_obj is None or img_obj.value is None:
             raise ValueError("No input image provided or failed to load.")
 
@@ -215,12 +223,16 @@ class PerspectiveTransformation(Component):
         best_quad = select_best_quad(src_img, candidates)
         warped = _four_point_transform(src_img, best_quad)
 
-        img_obj.value = warped
-        self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
+        try:
+            img_obj.value = warped
+            self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
+        except Exception as e:
+            raise ValueError(f"Failed to save image to Redis: {e}")
 
         self.context["src_quad"] = best_quad.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
 
         return build_response(context=self)
+
 
 Executor(sys.argv[1]).run()

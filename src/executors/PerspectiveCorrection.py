@@ -14,6 +14,9 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 from scipy.spatial import distance
 
 
+# ----------------------------
+# Temel Fonksiyonlar
+# ----------------------------
 
 def order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -127,6 +130,8 @@ def find_corners_from_edges(edges: np.ndarray) -> np.ndarray:
             ydiff = np.array([l1[0][1] - l1[0][3], l2[0][1] - l2[0][3]])
 
             def det(a, b):
+                a = np.array(a, dtype=np.float64)
+                b = np.array(b, dtype=np.float64)
                 return a[0] * b[1] - a[1] * b[0]
 
             div = det(xdiff, ydiff)
@@ -181,6 +186,9 @@ def correct_perspective_advanced(img: np.ndarray, params: Dict = None) -> np.nda
     return warped
 
 
+# ----------------------------
+# Component
+# ----------------------------
 
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):

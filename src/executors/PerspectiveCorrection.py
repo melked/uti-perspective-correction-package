@@ -153,7 +153,7 @@ def detect_document(image: np.ndarray) -> np.ndarray:
 
 # ------------------------------
 # Executor sınıfı
-class PerspectiveTransformation(Component):
+class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}
@@ -193,6 +193,5 @@ class PerspectiveTransformation(Component):
 
         return build_response(context=self)
 
-# ------------------------------
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

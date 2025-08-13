@@ -203,6 +203,5 @@ class PerspectiveCorrection(Component):
         self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
         return build_response(context=self)
 
-
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

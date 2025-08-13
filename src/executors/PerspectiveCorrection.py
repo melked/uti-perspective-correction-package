@@ -109,10 +109,8 @@ def detect_corners_hough(img: np.ndarray) -> np.ndarray:
     corners = _filter_corners(points, img.shape, tol=20)
     return corners
 
-# ------------------------------
-# Executor Sınıfı
-# ------------------------------
-class PerspectiveTransformation(Component):
+
+class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}

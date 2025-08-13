@@ -44,6 +44,14 @@ def _full_image_quad(image: np.ndarray) -> np.ndarray:
     return np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
 
 def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_area_ratio=0.05, max_area_ratio=0.95) -> np.ndarray:
+    # ✅ Her zaman 8-bit tek kanal garantisi
+    if binary_img is None or binary_img.size == 0:
+        return _full_image_quad(ref_image)
+    if len(binary_img.shape) == 3:  # renkli ise griye çevir
+        binary_img = cv2.cvtColor(binary_img, cv2.COLOR_BGR2GRAY)
+    if binary_img.dtype != np.uint8:  # 8-bit değilse normalize et
+        binary_img = cv2.normalize(binary_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
     contours, _ = cv2.findContours(binary_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return _full_image_quad(ref_image)
@@ -51,7 +59,7 @@ def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
     img_area = ref_image.shape[0] * ref_image.shape[1]
     min_area = img_area * min_area_ratio
-    max_area = img_area * max_area_ratio  # Çok büyük alanı sınırlıyoruz
+    max_area = img_area * max_area_ratio
 
     for c in contours:
         area = cv2.contourArea(c)
@@ -62,7 +70,6 @@ def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_
         if len(approx) == 4 and cv2.isContourConvex(approx):
             return approx.reshape(4, 2).astype(np.float32)
 
-    # Hiç uygun kontur yoksa tüm görseli döndür
     return _full_image_quad(ref_image)
 
 

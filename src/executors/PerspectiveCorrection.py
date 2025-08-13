@@ -105,31 +105,29 @@ def _line_intersections(lines: np.ndarray) -> np.ndarray:
             points.append([px, py])
     return np.array(points)
 
+
 def _compute_corners_from_lines(image: np.ndarray, edges: np.ndarray) -> np.ndarray:
     h, w = edges.shape[:2]
-    pad_h, pad_w = int(h*0.05), int(w*0.05)
-    roi = edges[pad_h:h-pad_h, pad_w:w-pad_w]
-    lines = cv2.HoughLinesP(roi, 1, np.pi/180, threshold=80, minLineLength=50, maxLineGap=10)
+    pad_h, pad_w = int(h * 0.05), int(w * 0.05)
+    roi = edges[pad_h:h - pad_h, pad_w:w - pad_w]
+    lines = cv2.HoughLinesP(roi, 1, np.pi / 180, threshold=80, minLineLength=50, maxLineGap=10)
     lines = _filter_lines(lines, 15)
-    if lines is None or len(lines)<4:
+    if lines is None or len(lines) < 4:
         return _full_image_quad(image)
+
     points = _line_intersections(lines)
     if points.shape[0] < 4:
         return _full_image_quad(image)
-    # Convex hull ile dış dörtgen
+
     hull = cv2.convexHull(points.astype(np.float32))
-    if hull.shape[0] > 4:
-        # En uzak 4 nokta: x+y min/max ve diff min/max
-        s = hull.sum(axis=1)
-        diff = np.diff(hull[:,0,:], axis=1)
-        ordered = np.array([
-            hull[np.argmin(s)][0],
-            hull[np.argmin(diff)][0],
-            hull[np.argmax(s)][0],
-            hull[np.argmax(diff)][0]
-        ], dtype=np.float32)
-        return ordered
-    return hull.reshape(-1,2)
+    # approxPolyDP ile 4 köşe tahmini
+    peri = cv2.arcLength(hull, True)
+    approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+    if approx.shape[0] != 4:
+        # Dörtgen değilse yine full image quad fallback
+        return _full_image_quad(image)
+    return approx.reshape(4, 2)
+
 
 # ------------------------------
 # Ensemble ile en iyi dörtgeni seç

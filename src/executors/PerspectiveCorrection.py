@@ -11,7 +11,6 @@ from sdks.novavision.src.helper.executor import Executor
 from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
-
 def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -22,169 +21,133 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
+def preprocess_variants(img):
+    variants = []
+    canny_params = [(30,100),(50,150),(100,200)]
+    blur_kernels = [(3,3),(5,5),(7,7)]
+    gamma_vals = [0.6,0.8,1.2]
 
-def correct_perspective_advanced(image, params=None):
-    gray_orig = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    def clahe(img):
-        clahe_obj = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    def clahe_fn(i):
+        clahe_obj = cv2.createCLAHE(clipLimit=i, tileGridSize=(8,8))
         return clahe_obj.apply(img)
 
-    def unsharp_mask(img):
-        gaussian = cv2.GaussianBlur(img, (9, 9), 10.0)
-        return cv2.addWeighted(img, 1.5, gaussian, -0.5, 0)
+    def unsharp_mask_fn(i):
+        gaussian = cv2.GaussianBlur(img,(i,i),10.0)
+        return cv2.addWeighted(img,1.5,gaussian,-0.5,0)
 
-    def preprocess_variants(img):
-        variants = []
+    # 1️⃣ Normal CLAHE + Canny
+    for low, high in canny_params:
+        v = clahe_fn(2.0)
+        edges = cv2.Canny(v,low,high)
+        variants.append((f"normal_{low}_{high}", edges))
 
-        # Canny eşik kombinasyonları
-        canny_params = [(30, 100), (50, 150), (100, 200)]
+    # 2️⃣ Agresif CLAHE + Unsharp + Canny
+    for low, high in canny_params:
+        v = unsharp_mask_fn(9)
+        edges = cv2.Canny(v,low,high)
+        variants.append((f"agresif_{low}_{high}", edges))
 
-        # Gaussian kernel boyutları
-        blur_kernels = [(3, 3), (5, 5), (7, 7)]
+    # 3️⃣ Yumuşak Gaussian Blur + Adaptive Threshold
+    for k in blur_kernels:
+        v = cv2.GaussianBlur(img,k,0)
+        thr = cv2.adaptiveThreshold(v,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,11,2)
+        variants.append((f"yumusak_{k[0]}",thr))
 
-        # 1️⃣ Normal CLAHE + Canny (farklı eşikler)
-        for low, high in canny_params:
-            v1 = clahe(img)
-            edges1 = cv2.Canny(v1, low, high)
-            variants.append((f"normal_{low}_{high}", edges1))
+    # 4️⃣ Gamma Correction + CLAHE + Canny
+    for g in gamma_vals:
+        v = clahe_fn(2.0)
+        gamma_corr = np.array(np.power(v/255.0,g)*255,dtype=np.uint8)
+        edges = cv2.Canny(gamma_corr,50,150)
+        variants.append((f"gamma_{g}",edges))
 
-        # 2️⃣ Agresif CLAHE + Unsharp + Canny
-        for low, high in canny_params:
-            v2 = unsharp_mask(clahe(img))
-            edges2 = cv2.Canny(v2, low, high)
-            variants.append((f"agresif_{low}_{high}", edges2))
+    # 5️⃣ CLAHE + Otsu
+    v = clahe_fn(2.0)
+    otsu = cv2.threshold(v,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]
+    variants.append(("otsu",otsu))
 
-        # 3️⃣ Yumuşak Gaussian Blur + Adaptive Threshold (farklı kernel boyutları)
-        for k in blur_kernels:
-            v3 = cv2.GaussianBlur(img, k, 0)
-            thr3 = cv2.adaptiveThreshold(v3, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, 11, 2)
-            variants.append((f"yumusak_{k[0]}", thr3))
+    # 6️⃣ Morph Gradient
+    for size in [3,5]:
+        v = clahe_fn(2.0)
+        morph = cv2.morphologyEx(v,cv2.MORPH_GRADIENT,np.ones((size,size),np.uint8))
+        variants.append((f"morph_{size}",morph))
 
-        # 4️⃣ Gamma Correction + CLAHE + Canny
-        for gamma_val in [0.6, 0.8, 1.2]:
-            v4 = clahe(img)
-            gamma_corrected = np.array(np.power(v4 / 255.0, gamma_val) * 255, dtype=np.uint8)
-            edges4 = cv2.Canny(gamma_corrected, 50, 150)
-            variants.append((f"gamma_{gamma_val}", edges4))
+    # 7️⃣ Bilateral + Canny
+    for d in [7,9]:
+        v = cv2.bilateralFilter(img,d,75,75)
+        edges = cv2.Canny(v,50,150)
+        variants.append((f"bilateral_{d}",edges))
 
-        # 5️⃣ CLAHE + Otsu Threshold
-        v5 = clahe(img)
-        otsu_thr = cv2.threshold(v5, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        variants.append(("otsu", otsu_thr))
+    # 8️⃣ Top-hat Morph + Canny
+    for size in [3,5]:
+        kernel = np.ones((size,size),np.uint8)
+        v = cv2.morphologyEx(img,cv2.MORPH_TOPHAT,kernel)
+        edges = cv2.Canny(v,50,150)
+        variants.append((f"tophat_{size}",edges))
 
-        # 6️⃣ Morphological Gradient (farklı kernel boyutları)
-        for size in [3, 5]:
-            v6 = clahe(img)
-            morph = cv2.morphologyEx(v6, cv2.MORPH_GRADIENT, np.ones((size, size), np.uint8))
-            variants.append((f"morph_gradient_{size}", morph))
+    return variants
 
-        # 7️⃣ Bilateral Filter + Canny (farklı parametreler)
-        for d in [7, 9]:
-            v7 = cv2.bilateralFilter(img, d, 75, 75)
-            edges7 = cv2.Canny(v7, 50, 150)
-            variants.append((f"bilateral_{d}", edges7))
+def find_corners_from_edges(edges):
+    # Hough Lines ile çizgi tespiti
+    lines = cv2.HoughLinesP(edges,1,np.pi/180,80,minLineLength=30,maxLineGap=10)
+    if lines is None:
+        return None
+    # Çizgilerden kesişim noktalarını bul
+    points = []
+    for i,l1 in enumerate(lines):
+        for j,l2 in enumerate(lines):
+            if i>=j: continue
+            xdiff = np.array([l1[0][0]-l1[0][2], l2[0][0]-l2[0][2]])
+            ydiff = np.array([l1[0][1]-l1[0][3], l2[0][1]-l2[0][3]])
+            def det(a,b): return a[0]*b[1]-a[1]*b[0]
+            div = det(xdiff,ydiff)
+            if div==0: continue
+            d = (det([l1[0][0],l1[0][1]],[l1[0][2],l1[0][3]]),det([l2[0][0],l2[0][1]],[l2[0][2],l2[0][3]]))
+            x = det(d,xdiff)/div
+            y = det(d,ydiff)/div
+            if 0<=x<edges.shape[1] and 0<=y<edges.shape[0]:
+                points.append([x,y])
+    if len(points)<4:
+        return None
+    points = np.array(points,dtype=np.float32)
+    # Köşe iyileştirme
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1)
+    cv2.cornerSubPix(edges,points,(5,5),(-1,-1),criteria)
+    # 4 en iyi köşe seçimi (basit: en uzak 4 nokta)
+    from scipy.spatial import distance
+    dists = distance.cdist(points,points)
+    sumd = dists.sum(axis=1)
+    idxs = np.argsort(sumd)[-4:]
+    return points[idxs]
 
-        # 8️⃣ Top-hat Morphology + Canny
-        for size in [3, 5]:
-            kernel = np.ones((size, size), np.uint8)
-            tophat = cv2.morphologyEx(img, cv2.MORPH_TOPHAT, kernel)
-            edges8 = cv2.Canny(tophat, 50, 150)
-            variants.append((f"tophat_{size}", edges8))
-
-        return variants
-
-    def validate_contour(cnt, edges, img_shape):
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        if len(approx) != 4:
-            return None
-        if not cv2.isContourConvex(approx):
-            return None
-        area = cv2.contourArea(approx)
-        h, w = img_shape[:2]
-        if area < 0.01 * w * h or area > 0.9 * w * h:
-            return None
-        pts = approx.reshape(4, 2)
-        widths = [np.linalg.norm(pts[i] - pts[(i+1) % 4]) for i in range(4)]
-        min_w, max_w = min(widths), max(widths)
-        if min_w / max_w < 0.2:
-            return None
-        mask = np.zeros_like(edges)
-        cv2.drawContours(mask, [approx], -1, 255, 2)
-        overlap = cv2.countNonZero(cv2.bitwise_and(mask, edges))
-        total_edge = cv2.countNonZero(mask)
-        if total_edge == 0 or (overlap / total_edge) < 0.7:
-            return None
-        return approx
-
-    def score_contour(cnt, img_shape):
-        pts = cnt.reshape(4, 2)
-        h, w = img_shape[:2]
-        center = np.array([w / 2, h / 2])
-        area = cv2.contourArea(cnt)
-        area_score = 1 - abs(area - 0.25 * w * h) / (0.25 * w * h)
-        widths = [np.linalg.norm(pts[i] - pts[(i + 1) % 4]) for i in range(4)]
-        height_diff = abs(widths[0] - widths[2]) / max(widths[0], widths[2])
-        width_diff = abs(widths[1] - widths[3]) / max(widths[1], widths[3])
-        rect_score = 1 - (height_diff + width_diff) / 2
-        cnt_center = np.mean(pts, axis=0)
-        dist_center = np.linalg.norm(cnt_center - center)
-        max_dist = np.linalg.norm(np.array([w / 2, h / 2]))
-        center_score = 1 - (dist_center / max_dist)
-        return area_score + rect_score + center_score
-
-    variants = preprocess_variants(gray_orig)
-    candidates = []
-
-    for name, processed in variants:
-        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in contours:
-            valid = validate_contour(cnt, processed, image.shape)
-            if valid is not None:
-                score = score_contour(valid, image.shape)
-                candidates.append((score, valid))
-
-    if not candidates:
-        thr = cv2.threshold(gray_orig, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            biggest = max(contours, key=cv2.contourArea)
-            peri = cv2.arcLength(biggest, True)
-            approx = cv2.approxPolyDP(biggest, 0.02 * peri, True)
-            if len(approx) == 4:
-                candidates.append((0, approx))
-
-    if not candidates:
+def correct_perspective_advanced(image, params=None):
+    gray = cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+    variants = preprocess_variants(gray)
+    best_rect = None
+    max_score = -1
+    for name,edges in variants:
+        corners = find_corners_from_edges(edges)
+        if corners is None: continue
+        # Basit scoring: alan + merkeze yakınlık
+        tl,tr,br,bl = order_points(corners)
+        w = int(max(np.linalg.norm(br-bl),np.linalg.norm(tr-tl)))
+        h = int(max(np.linalg.norm(tr-br),np.linalg.norm(tl-bl)))
+        score = w*h - abs(np.mean(corners[:,0])-gray.shape[1]/2) - abs(np.mean(corners[:,1])-gray.shape[0]/2)
+        if score>max_score:
+            max_score=score
+            best_rect = np.array([tl,tr,br,bl],dtype=np.float32)
+    if best_rect is None:
         return image
-
-    best = max(candidates, key=lambda x: x[0])[1]
-    rect = order_points(best.reshape(4, 2))
-    (tl, tr, br, bl) = rect
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(max(widthA, widthB))
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(max(heightA, heightB))
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
-    ], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]],dtype=np.float32)
+    M = cv2.getPerspectiveTransform(best_rect,dst)
+    warped = cv2.warpPerspective(image,M,(w,h))
     return warped
 
-
 class PerspectiveCorrection(Component):
-    def __init__(self, request, bootstrap):
-        super().__init__(request, bootstrap)
+    def __init__(self,request,bootstrap):
+        super().__init__(request,bootstrap)
         self.request.model = PackageModel(**(self.request.data))
         self.image = self.request.get_param("inputImage")
-        self.params = self.request.get_param("params", None)
+        self.params = self.request.get_param("params",None)
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
@@ -193,15 +156,15 @@ class PerspectiveCorrection(Component):
     def run(self):
         img = Image.get_frame(img=self.image, redis_db=self.redis_db)
         img_np = img.value
-        if img_np.dtype != np.uint8:
-            if img_np.max() <= 1.0:
-                img_np = (img_np * 255).astype(np.uint8)
+        if img_np.dtype!=np.uint8:
+            if img_np.max()<=1.0:
+                img_np = (img_np*255).astype(np.uint8)
             else:
                 img_np = img_np.astype(np.uint8)
-        result_img = correct_perspective_advanced(img_np, self.params)
+        result_img = correct_perspective_advanced(img_np,self.params)
         img.value = np.array(result_img)
-        self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
+        self.image = Image.set_frame(img=img,package_uID=self.uID,redis_db=self.redis_db)
         return build_response(context=self)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     Executor(sys.argv[1]).run()

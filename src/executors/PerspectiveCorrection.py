@@ -12,6 +12,7 @@ from sdks.novavision.src.helper.executor import Executor
 from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
+
 # ---------------- Utility Functions ---------------- #
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
@@ -25,6 +26,7 @@ def _order_points(pts: np.ndarray) -> np.ndarray:
     rect[3] = pts[np.argmax(diff)]
     return rect
 
+
 def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     rect = _order_points(pts)
     (tl, tr, br, bl) = rect
@@ -34,16 +36,19 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxHeight = int(round(max(heightA, heightB)))
-    dst = np.array([[0,0],[maxWidth-1,0],[maxWidth-1,maxHeight-1],[0,maxHeight-1]], dtype=np.float32)
+    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
     return warped
 
+
 def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
-    return np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
+    return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
-def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_area_ratio=0.03, max_area_ratio=0.95) -> np.ndarray:
+
+def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_area_ratio=0.03,
+                             max_area_ratio=0.95) -> np.ndarray:
     if binary_img is None or binary_img.size == 0:
         return _full_image_quad(ref_image)
     if len(binary_img.shape) == 3:
@@ -71,89 +76,113 @@ def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_
 
     return _full_image_quad(ref_image)
 
-def _unsharp_mask(image, ksize=(5,5), strength=1.5):
+
+def _unsharp_mask(image, ksize=(5, 5), strength=1.5):
     blur = cv2.GaussianBlur(image, ksize, 0)
     return cv2.addWeighted(image, 1 + strength, blur, -strength, 0)
+
 
 def _gamma_correction(image: np.ndarray, gamma=1.5) -> np.ndarray:
     invGamma = 1.0 / gamma
     table = np.array([(i / 255.0) ** invGamma * 255 for i in np.arange(256)]).astype("uint8")
     return cv2.LUT(image, table)
 
-# ---------------- Preprocessing & Enhancement ---------------- #
 
-def _adaptive_contrast_enhancement(image: np.ndarray) -> np.ndarray:
+# ---------------- Preprocessing ---------------- #
+
+def _adaptive_contrast_enhancement(image: np.ndarray, clip_limit=3.0) -> np.ndarray:
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    L,A,B = cv2.split(lab)
-    mean_lum = np.mean(L)
-    clahe_clip = 2.0 if mean_lum < 100 else 3.0
-    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8,8))
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
     cl = clahe.apply(L)
-    img_clahe = cv2.cvtColor(cv2.merge((cl,A,B)), cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(cv2.merge((cl, A, B)), cv2.COLOR_LAB2BGR)
 
-    gray = cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (7,7), 0)
-    diff = cv2.absdiff(gray, blur)
-    _, mask = cv2.threshold(diff, 6, 255, cv2.THRESH_BINARY)
-    img_clahe[mask == 0] = np.median(img_clahe, axis=(0,1))
-
-    mean_gray = np.mean(cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY))
-    if mean_gray < 70: gamma = 2.0
-    elif mean_gray > 180: gamma = 0.5
-    else: gamma = 1.0
-    return _gamma_correction(img_clahe, gamma)
 
 def _preprocess_image_for_edges(image: np.ndarray) -> np.ndarray:
     bilateral = cv2.bilateralFilter(image, 9, 75, 75)
     lab = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
-    L,A,B = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     cl = clahe.apply(L)
-    img_clahe = cv2.cvtColor(cv2.merge((cl,A,B)), cv2.COLOR_LAB2BGR)
+    img_clahe = cv2.cvtColor(cv2.merge((cl, A, B)), cv2.COLOR_LAB2BGR)
     return _unsharp_mask(img_clahe)
 
-# ---------------- Aggressive Document Detection ---------------- #
 
-def _auto_detect_document_corners_aggressive(image: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-    clahe_img = clahe.apply(gray)
+# ---------------- Multi-Pipeline Candidate Detection ---------------- #
 
-    mean_gray = np.mean(clahe_img)
-    gamma = 2.0 if mean_gray < 70 else 0.5 if mean_gray > 180 else 1.0
-    img_gamma = _gamma_correction(cv2.cvtColor(cv2.merge([clahe_img]*3), cv2.COLOR_BGR2RGB), gamma)
-    gray_gamma = cv2.cvtColor(img_gamma, cv2.COLOR_BGR2GRAY)
-
-    blurred = cv2.bilateralFilter(gray_gamma,9,75,75)
-    sharpened = _unsharp_mask(blurred)
-
-    edges = cv2.Canny(sharpened, 30, 120)
-    thresh = cv2.adaptiveThreshold(sharpened,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY_INV,11,2)
-    combined = cv2.bitwise_or(edges, thresh)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    quad = _find_quad_from_contours(closed, image)
-    return quad
-
-# ---------------- Candidate Detection & Selection ---------------- #
-
-def detect_document_candidates(image: np.ndarray) -> List[np.ndarray]:
+def _detect_candidates_with_varied_filters(image: np.ndarray) -> List[np.ndarray]:
     candidates = []
-    img_corrected = _adaptive_contrast_enhancement(image)
-    img_preprocessed = _preprocess_image_for_edges(img_corrected)
-    try:
-        quad = _auto_detect_document_corners_aggressive(img_preprocessed)
-        candidates.append(quad)
-    except Exception as e:
-        print(f"Pipeline error: {e}")
+    clip_limits = [2.0, 3.0]
+    gammas = [0.5, 1.0, 2.0]
+    unsharp_strengths = [0.5, 1.0, 1.5]
+
+    for clip in clip_limits:
+        img_clahe = _adaptive_contrast_enhancement(image, clip_limit=clip)
+        img_pre = _preprocess_image_for_edges(img_clahe)
+        for gamma in gammas:
+            img_gamma = _gamma_correction(img_pre, gamma)
+            for strength in unsharp_strengths:
+                img_final = _unsharp_mask(img_gamma, strength=strength)
+                try:
+                    gray = cv2.cvtColor(img_final, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(gray, 30, 120)
+                    quad = _find_quad_from_contours(edges, image)
+                    candidates.append(quad)
+                except:
+                    continue
+    if not candidates:
         candidates.append(_full_image_quad(image))
     return candidates
 
+
+# ---------------- Quad Scoring ---------------- #
+
+def _angle_score(quad: np.ndarray) -> float:
+    def angle(pt1, pt2, pt3):
+        v1 = pt1 - pt2
+        v2 = pt3 - pt2
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+        ang = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+        return np.degrees(ang)
+
+    angles = [angle(quad[i], quad[(i + 1) % 4], quad[(i + 2) % 4]) for i in range(4)]
+    score = sum([1 - abs(a - 90) / 90 for a in angles]) / 4
+    return score
+
+
+def _convexity_score(quad: np.ndarray) -> float:
+    return 1.0 if cv2.isContourConvex(quad.astype(np.float32)) else 0.0
+
+
+def _area_score(quad: np.ndarray, image: np.ndarray) -> float:
+    area = cv2.contourArea(quad.astype(np.float32))
+    img_area = image.shape[0] * image.shape[1]
+    return min(area / img_area, 1.0)
+
+
+def _shape_score(quad: np.ndarray) -> float:
+    d1 = np.linalg.norm(quad[0] - quad[1])
+    d2 = np.linalg.norm(quad[1] - quad[2])
+    d3 = np.linalg.norm(quad[2] - quad[3])
+    d4 = np.linalg.norm(quad[3] - quad[0])
+    lengths = np.array([d1, d2, d3, d4])
+    return 1.0 - np.std(lengths) / np.mean(lengths) if np.mean(lengths) > 0 else 0.0
+
+
+def _score_quad(quad: np.ndarray, image: np.ndarray) -> float:
+    area_s = _area_score(quad, image)
+    conv_s = _convexity_score(quad)
+    angle_s = _angle_score(quad)
+    shape_s = _shape_score(quad)
+    total_score = 0.4 * area_s + 0.2 * conv_s + 0.2 * angle_s + 0.2 * shape_s
+    return total_score
+
+
 def select_best_quad(image: np.ndarray, candidates: List[np.ndarray]) -> np.ndarray:
-    return candidates[0]
+    scored = [(quad, _score_quad(quad, image)) for quad in candidates]
+    best = max(scored, key=lambda x: x[1])[0]
+    return best
+
 
 # ---------------- Component ---------------- #
 
@@ -169,13 +198,13 @@ class PerspectiveCorrection(Component):
         return {}
 
     def _prepare_image(self, img: np.ndarray) -> np.ndarray:
-        if img is None or img.size==0:
+        if img is None or img.size == 0:
             raise ValueError("Input image empty or None")
         if img.dtype != np.uint8:
-            img = cv2.normalize(img,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
-        if img.ndim==2:
+            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[-1]==4:
+        elif img.shape[-1] == 4:
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         return img
 
@@ -184,7 +213,7 @@ class PerspectiveCorrection(Component):
         if img_obj is None or img_obj.value is None:
             raise ValueError("No input image provided or failed to load")
         src_img = self._prepare_image(img_obj.value)
-        candidates = detect_document_candidates(src_img)
+        candidates = _detect_candidates_with_varied_filters(src_img)
         best_quad = select_best_quad(src_img, candidates)
         warped = _four_point_transform(src_img, best_quad)
         img_obj.value = warped
@@ -192,5 +221,6 @@ class PerspectiveCorrection(Component):
         self.context["src_quad"] = best_quad.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
         return build_response(context=self)
+
 
 Executor(sys.argv[1]).run()

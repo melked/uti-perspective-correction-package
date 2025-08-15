@@ -82,7 +82,7 @@ def _gamma_correction(image: np.ndarray, gamma=1.5) -> np.ndarray:
 
 # ---------------- Preprocessing & Enhancement ---------------- #
 
-def _adaptive_contrast_enhancement(image: np.ndarray, mode="soft") -> np.ndarray:
+def _adaptive_contrast_enhancement(image: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     L,A,B = cv2.split(lab)
     mean_lum = np.mean(L)
@@ -94,7 +94,7 @@ def _adaptive_contrast_enhancement(image: np.ndarray, mode="soft") -> np.ndarray
     gray = cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7,7), 0)
     diff = cv2.absdiff(gray, blur)
-    _, mask = cv2.threshold(diff, 12 if mode=="soft" else 6, 255, cv2.THRESH_BINARY)
+    _, mask = cv2.threshold(diff, 6, 255, cv2.THRESH_BINARY)
     img_clahe[mask == 0] = np.median(img_clahe, axis=(0,1))
 
     mean_gray = np.mean(cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY))
@@ -112,67 +112,43 @@ def _preprocess_image_for_edges(image: np.ndarray) -> np.ndarray:
     img_clahe = cv2.cvtColor(cv2.merge((cl,A,B)), cv2.COLOR_LAB2BGR)
     return _unsharp_mask(img_clahe)
 
-# ---------------- Document Detection Pipelines ---------------- #
+# ---------------- Aggressive Document Detection ---------------- #
 
-def _auto_detect_document_corners_sharpen_adaptive(image: np.ndarray) -> np.ndarray:
+def _auto_detect_document_corners_aggressive(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blur = cv2.bilateralFilter(gray,9,75,75)
-    sharpened = _unsharp_mask(blur)
-    thresh = cv2.adaptiveThreshold(sharpened,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,11,2)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
-    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
-    return _find_quad_from_contours(morph, image)
-
-def _auto_detect_document_corners_clahe_canny(image: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    edges = cv2.Canny(clahe.apply(gray),50,150)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
-    morph = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
-    return _find_quad_from_contours(morph,image)
-
-def _auto_detect_document_corners_bright_blur(image: np.ndarray) -> np.ndarray:
-    img_gamma = _gamma_correction(image, gamma=1.8)
-    gray = cv2.cvtColor(img_gamma, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     clahe_img = clahe.apply(gray)
-    sharp = _unsharp_mask(clahe_img)
-    edges = cv2.Canny(sharp,30,120)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(7,7))
-    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return _find_quad_from_contours(closed,image)
 
-def _auto_detect_document_corners_mixed(image: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray,30,120)
-    thresh = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+    mean_gray = np.mean(clahe_img)
+    gamma = 2.0 if mean_gray < 70 else 0.5 if mean_gray > 180 else 1.0
+    img_gamma = _gamma_correction(cv2.cvtColor(cv2.merge([clahe_img]*3), cv2.COLOR_BGR2RGB), gamma)
+    gray_gamma = cv2.cvtColor(img_gamma, cv2.COLOR_BGR2GRAY)
+
+    blurred = cv2.bilateralFilter(gray_gamma,9,75,75)
+    sharpened = _unsharp_mask(blurred)
+
+    edges = cv2.Canny(sharpened, 30, 120)
+    thresh = cv2.adaptiveThreshold(sharpened,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY_INV,11,2)
     combined = cv2.bitwise_or(edges, thresh)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
-    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=1)
-    return _find_quad_from_contours(closed,image)
+    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    quad = _find_quad_from_contours(closed, image)
+    return quad
 
 # ---------------- Candidate Detection & Selection ---------------- #
 
-def detect_document_candidates(image: np.ndarray, mode="soft") -> List[np.ndarray]:
+def detect_document_candidates(image: np.ndarray) -> List[np.ndarray]:
     candidates = []
-    img_corrected = _adaptive_contrast_enhancement(image, mode=mode)
+    img_corrected = _adaptive_contrast_enhancement(image)
     img_preprocessed = _preprocess_image_for_edges(img_corrected)
-    pipelines = [
-        _auto_detect_document_corners_sharpen_adaptive,
-        _auto_detect_document_corners_clahe_canny,
-        _auto_detect_document_corners_bright_blur,
-        _auto_detect_document_corners_mixed
-    ]
-    for func in pipelines:
-        try:
-            quad = func(img_preprocessed)
-            if not np.allclose(quad,_full_image_quad(image),atol=1):
-                candidates.append(quad)
-        except Exception as e:
-            print(f"Pipeline error: {e}")
-    if not candidates:
+    try:
+        quad = _auto_detect_document_corners_aggressive(img_preprocessed)
+        candidates.append(quad)
+    except Exception as e:
+        print(f"Pipeline error: {e}")
         candidates.append(_full_image_quad(image))
     return candidates
 
@@ -208,7 +184,7 @@ class PerspectiveCorrection(Component):
         if img_obj is None or img_obj.value is None:
             raise ValueError("No input image provided or failed to load")
         src_img = self._prepare_image(img_obj.value)
-        candidates = detect_document_candidates(src_img, mode="aggressive")
+        candidates = detect_document_candidates(src_img)
         best_quad = select_best_quad(src_img, candidates)
         warped = _four_point_transform(src_img, best_quad)
         img_obj.value = warped

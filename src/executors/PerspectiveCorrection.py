@@ -28,16 +28,11 @@ def _order_points(pts: np.ndarray) -> np.ndarray:
 def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     rect = _order_points(pts)
     (tl, tr, br, bl) = rect
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(round(max(widthA, widthB)))
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(round(max(heightA, heightB)))
+    maxWidth = int(round(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))))
+    maxHeight = int(round(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))))
     dst = np.array([[0,0],[maxWidth-1,0],[maxWidth-1,maxHeight-1],[0,maxHeight-1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
-    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
-    return warped
+    return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
@@ -55,23 +50,18 @@ def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_
     if not contours:
         return _full_image_quad(ref_image)
 
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
     img_area = ref_image.shape[0] * ref_image.shape[1]
-    min_area = img_area * min_area_ratio
-    max_area = img_area * max_area_ratio
+    min_area, max_area = img_area * min_area_ratio, img_area * max_area_ratio
 
-    for c in contours:
+    for c in sorted(contours, key=cv2.contourArea, reverse=True):
         area = cv2.contourArea(c)
         if area < min_area or area > max_area:
             continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
             return approx.reshape(4, 2).astype(np.float32)
 
     return _full_image_quad(ref_image)
-
-# ---------------- Enhancement ---------------- #
 
 def _unsharp_mask(image, ksize=(5,5), strength=1.5):
     blur = cv2.GaussianBlur(image, ksize, 0)
@@ -79,24 +69,20 @@ def _unsharp_mask(image, ksize=(5,5), strength=1.5):
 
 def _gamma_correction(image: np.ndarray, gamma=1.5) -> np.ndarray:
     invGamma = 1.0 / gamma
-    table = np.array([(i / 255.0) ** invGamma * 255 for i in np.arange(256)]).astype("uint8")
+    table = np.array([(i / 255.0) ** invGamma * 255 for i in range(256)]).astype("uint8")
     return cv2.LUT(image, table)
+
+# ---------------- Preprocessing & Enhancement ---------------- #
 
 def _adaptive_contrast_enhancement(image: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     L,A,B = cv2.split(lab)
-    mean_lum = np.mean(L)
-    clahe = cv2.createCLAHE(clipLimit=2.0 if mean_lum<100 else 3.0, tileGridSize=(8,8))
+    clahe = cv2.createCLAHE(clipLimit=2.0 if np.mean(L)<100 else 3.0, tileGridSize=(8,8))
     cl = clahe.apply(L)
-    # Saturation boost halı/desenli arka planlar için
-    hsv = cv2.cvtColor(cv2.cvtColor(cv2.merge((cl,A,B)), cv2.COLOR_LAB2BGR), cv2.COLOR_BGR2HSV)
-    h,s,v = cv2.split(hsv)
-    s = cv2.addWeighted(s,1.3,np.zeros_like(s),0,0)
-    img_hsv = cv2.merge((h,s,v))
-    img_bgr = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)
-    mean_gray = np.mean(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY))
+    img_clahe = cv2.cvtColor(cv2.merge((cl,A,B)), cv2.COLOR_LAB2BGR)
+    mean_gray = np.mean(cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY))
     gamma = 1.8 if mean_gray<80 else 0.6 if mean_gray>180 else 1.0
-    return _gamma_correction(img_bgr, gamma)
+    return _gamma_correction(img_clahe, gamma)
 
 def _preprocess_image_for_edges(image: np.ndarray) -> np.ndarray:
     bilateral = cv2.bilateralFilter(image, 9, 75, 75)
@@ -107,97 +93,94 @@ def _preprocess_image_for_edges(image: np.ndarray) -> np.ndarray:
     img_clahe = cv2.cvtColor(cv2.merge((cl,A,B)), cv2.COLOR_LAB2BGR)
     return _unsharp_mask(img_clahe)
 
-# ---------------- Hough-based Köşe Tahmini ---------------- #
+# ---------------- Document Detection Pipelines ---------------- #
 
-def _hough_corner_estimation(image: np.ndarray) -> np.ndarray:
+def _auto_detect_document_corners_sharpen_adaptive(image: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray,50,150)
-    lines = cv2.HoughLinesP(edges,1,np.pi/180, threshold=100,minLineLength=image.shape[1]//5,maxLineGap=20)
-    points = []
-    if lines is not None:
-        for l in lines:
-            x1,y1,x2,y2 = l[0]
-            points.extend([[x1,y1],[x2,y2]])
-        points = np.array(points)
-        rect = cv2.minAreaRect(points)
-        box = cv2.boxPoints(rect)
-        return box.astype(np.float32)
-    else:
-        return _full_image_quad(image)
+    blur = cv2.bilateralFilter(gray,9,75,75)
+    sharpened = _unsharp_mask(blur)
+    thresh = cv2.adaptiveThreshold(sharpened,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,11,2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
+    return _find_quad_from_contours(morph, image)
 
-# ---------------- Complex Background Mask ---------------- #
+def _auto_detect_document_corners_clahe_canny(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    edges = cv2.Canny(clahe.apply(gray),50,150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
+    morph = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    return _find_quad_from_contours(morph,image)
 
-def _mask_background_complex(image: np.ndarray) -> np.ndarray:
+def _auto_detect_document_corners_bright_blur(image: np.ndarray) -> np.ndarray:
+    img_gamma = _gamma_correction(image, gamma=1.8)
+    gray = cv2.cvtColor(img_gamma, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    clahe_img = clahe.apply(gray)
+    sharp = _unsharp_mask(clahe_img)
+    edges = cv2.Canny(sharp,30,120)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(7,7))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return _find_quad_from_contours(closed,image)
+
+def _auto_detect_document_corners_inverse_threshold(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray,(5,5),0)
+    _, thresh = cv2.threshold(blur,0,255,cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
+    return _find_quad_from_contours(morph,image)
+
+def _auto_detect_document_corners_gradient_magnitude(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F,1,0,ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F,0,1,ksize=3)
+    mag,_ = cv2.cartToPolar(grad_x,grad_y,angleInDegrees=True)
+    _, thresh = cv2.threshold(mag,50,255,cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel)
+    return _find_quad_from_contours(morph,image)
+
+def _auto_detect_document_corners_dark_object(image: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    L, A, B = cv2.split(lab)
+    L = cv2.split(lab)[0]
+    _, dark_mask = cv2.threshold(L,80,255,cv2.THRESH_BINARY_INV)
+    edges = cv2.Canny(dark_mask,50,150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return _find_quad_from_contours(closed,image)
 
-    _, mask_a = cv2.threshold(A, 135, 255, cv2.THRESH_BINARY_INV)
-    _, mask_b = cv2.threshold(B, 135, 255, cv2.THRESH_BINARY)
-    color_mask = cv2.bitwise_and(mask_a, mask_b)
-
-    L_blur = cv2.GaussianBlur(L, (5, 5), 0)
-    light_mask = cv2.adaptiveThreshold(
-        L_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 15, 5
-    )
-
-    edge_mask = cv2.Canny(L_blur, 40, 120)
-
-    combined = cv2.bitwise_or(light_mask, edge_mask)
-    combined = cv2.bitwise_and(combined, color_mask)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=2)
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    return combined
-
-# ---------------- Document Detection ---------------- #
+# ---------------- Candidate Detection & Selection ---------------- #
 
 def detect_document_candidates(image: np.ndarray) -> List[np.ndarray]:
     candidates = []
-
-    # 1️⃣ Adaptive contrast + gamma + saturation
     img_corrected = _adaptive_contrast_enhancement(image)
-
-    # 2️⃣ Agresif pipeline
-    img_aggressive = _preprocess_image_for_edges(img_corrected)
-
-    # 3️⃣ Yumuşak pipeline
-    img_gray = cv2.cvtColor(img_corrected, cv2.COLOR_BGR2GRAY)
-    img_soft = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY_INV, 15, 4)
-    img_soft = cv2.cvtColor(img_soft, cv2.COLOR_GRAY2BGR)
-
-    # 4️⃣ Complex background mask pipeline
-    img_mask = _mask_background_complex(img_corrected)
-    img_mask_bgr = cv2.cvtColor(img_mask, cv2.COLOR_GRAY2BGR)
-
-    # ---------------- Pipelines ---------------- #
+    img_preprocessed = _preprocess_image_for_edges(img_corrected)
     pipelines = [
-        lambda img: _find_quad_from_contours(cv2.adaptiveThreshold(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),255,
-                                                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,11,2),
-                                            img),
-        lambda img: _find_quad_from_contours(cv2.cvtColor(img_soft, cv2.COLOR_BGR2GRAY), img),
-        lambda img: _find_quad_from_contours(cv2.cvtColor(img_mask_bgr, cv2.COLOR_BGR2GRAY), img),
-        lambda img: _hough_corner_estimation(img_aggressive)
+        _auto_detect_document_corners_sharpen_adaptive,
+        _auto_detect_document_corners_clahe_canny,
+        _auto_detect_document_corners_bright_blur,
+        _auto_detect_document_corners_inverse_threshold,
+        _auto_detect_document_corners_gradient_magnitude,
+        _auto_detect_document_corners_dark_object
     ]
-
     for func in pipelines:
         try:
-            quad = func(img_aggressive)
-            if not np.allclose(quad,_full_image_quad(image), atol=1):
+            quad = func(img_preprocessed)
+            if not np.allclose(quad,_full_image_quad(image),atol=1):
                 candidates.append(quad)
         except Exception as e:
             print(f"Pipeline error: {e}")
-
     if not candidates:
         candidates.append(_full_image_quad(image))
     return candidates
 
 def select_best_quad(image: np.ndarray, candidates: List[np.ndarray]) -> np.ndarray:
-    areas = [cv2.contourArea(c.reshape(-1,1,2)) for c in candidates]
-    return candidates[np.argmax(areas)]
+    # Şimdilik ilk bulunanı al, ileride skor mantığı eklenebilir
+    return candidates[0]
 
 # ---------------- Component ---------------- #
 

@@ -43,7 +43,7 @@ def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     return np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
 
-def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_area_ratio=0.05, max_area_ratio=0.95) -> np.ndarray:
+def _find_quad_from_contours(binary_img: np.ndarray, ref_image: np.ndarray, min_area_ratio=0.03, max_area_ratio=0.95) -> np.ndarray:
     if binary_img is None or binary_img.size == 0:
         return _full_image_quad(ref_image)
     if len(binary_img.shape) == 3:
@@ -91,15 +91,16 @@ def _adaptive_contrast_enhancement(image: np.ndarray, mode="soft") -> np.ndarray
     cl = clahe.apply(L)
     img_clahe = cv2.cvtColor(cv2.merge((cl,A,B)), cv2.COLOR_LAB2BGR)
 
-    # Arka plan bastırma — soft/agresif farkı
     gray = cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (7,7), 0)
     diff = cv2.absdiff(gray, blur)
     _, mask = cv2.threshold(diff, 12 if mode=="soft" else 6, 255, cv2.THRESH_BINARY)
-    img_clahe[mask == 0] = (np.median(img_clahe[:,:,0]), np.median(img_clahe[:,:,1]), np.median(img_clahe[:,:,2]))
+    img_clahe[mask == 0] = np.median(img_clahe, axis=(0,1))
 
     mean_gray = np.mean(cv2.cvtColor(img_clahe, cv2.COLOR_BGR2GRAY))
-    gamma = 1.8 if mean_gray < 80 else 0.6 if mean_gray > 180 else 1.0
+    if mean_gray < 70: gamma = 2.0
+    elif mean_gray > 180: gamma = 0.5
+    else: gamma = 1.0
     return _gamma_correction(img_clahe, gamma)
 
 def _preprocess_image_for_edges(image: np.ndarray) -> np.ndarray:
@@ -142,6 +143,16 @@ def _auto_detect_document_corners_bright_blur(image: np.ndarray) -> np.ndarray:
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
     return _find_quad_from_contours(closed,image)
 
+def _auto_detect_document_corners_mixed(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray,30,120)
+    thresh = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV,11,2)
+    combined = cv2.bitwise_or(edges, thresh)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(5,5))
+    closed = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return _find_quad_from_contours(closed,image)
+
 # ---------------- Candidate Detection & Selection ---------------- #
 
 def detect_document_candidates(image: np.ndarray, mode="soft") -> List[np.ndarray]:
@@ -151,7 +162,8 @@ def detect_document_candidates(image: np.ndarray, mode="soft") -> List[np.ndarra
     pipelines = [
         _auto_detect_document_corners_sharpen_adaptive,
         _auto_detect_document_corners_clahe_canny,
-        _auto_detect_document_corners_bright_blur
+        _auto_detect_document_corners_bright_blur,
+        _auto_detect_document_corners_mixed
     ]
     for func in pipelines:
         try:
@@ -196,7 +208,7 @@ class PerspectiveCorrection(Component):
         if img_obj is None or img_obj.value is None:
             raise ValueError("No input image provided or failed to load")
         src_img = self._prepare_image(img_obj.value)
-        candidates = detect_document_candidates(src_img, mode="aggressive")  # ahşap/bulanık zeminlerde daha iyi
+        candidates = detect_document_candidates(src_img, mode="aggressive")
         best_quad = select_best_quad(src_img, candidates)
         warped = _four_point_transform(src_img, best_quad)
         img_obj.value = warped

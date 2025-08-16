@@ -65,20 +65,16 @@ def _min_area_rect_quad(binary_or_gray: np.ndarray, ref_image: np.ndarray) -> np
 
 # ---------------------- Preprocessing Pipelines (Geliştirilmiş) ---------------------- #
 
-# YENİ -> Strateji 1 için renk maskesi oluşturucu
 def _create_document_mask(image_bgr: np.ndarray) -> np.ndarray:
-    """Açık renkli belgeyi arka plandan ayırmak için HSV renk maskesi oluşturur."""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    lower_bound = np.array([0, 0, 120])  # Parlaklık eşiğini biraz daha düşük tutarak gölgeleri de yakalayabiliriz
-    upper_bound = np.array([180, 80, 255])  # Doygunluk eşiğini biraz artırarak soluk renkleri de alabiliriz
+    lower_bound = np.array([0, 0, 120])
+    upper_bound = np.array([180, 80, 255])
     mask = cv2.inRange(hsv, lower_bound, upper_bound)
-    # Maskedeki gürültüyü daha etkili temizlemek için kernel boyutu artırıldı
     kernel = np.ones((7, 7), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
     return mask
 
 
-# Orijinal pipeline fonksiyonlarınız (Strateji 2 için kullanılacak)
 def _pre_soft(gray: np.ndarray) -> np.ndarray:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 11)
@@ -116,9 +112,7 @@ def _pre_extreme(gray: np.ndarray) -> np.ndarray:
     return edges
 
 
-# GÜNCELLENDİ -> Artık Strateji 2 için LAB renk uzayını kullanıyor
 def _generate_edge_maps(image_bgr: np.ndarray) -> List[np.ndarray]:
-    """LAB renk uzayının L kanalını ve CLAHE'yi kullanarak kenar haritaları üretir."""
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l_channel, _, _ = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -127,20 +121,15 @@ def _generate_edge_maps(image_bgr: np.ndarray) -> List[np.ndarray]:
 
 
 # ---------------------- Candidate Generation (Orijinal) ---------------------- #
+
 def _find_quads_from_contours(binary_img: np.ndarray, ref_image: np.ndarray) -> List[np.ndarray]:
-    # RETR_EXTERNAL sadece en dış konturları bulur, bu daha verimlidir.
     contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return []
-
     H, W = ref_image.shape[:2]
-    img_area = H * W
-    min_area = img_area * 0.10  # Alan eşiğini %10'a yükselterek küçük gürültüleri eleyelim
-    max_area = img_area * 0.98
-
+    min_area = H * W * 0.10
     candidates = []
-    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:  # En büyük 5 kontur yeterli
-        area = cv2.contourArea(c)
-        if not (min_area < area < max_area): continue
+    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        if cv2.contourArea(c) < min_area: continue
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
@@ -149,12 +138,39 @@ def _find_quads_from_contours(binary_img: np.ndarray, ref_image: np.ndarray) -> 
 
 
 def _find_quads_from_hough(edges: np.ndarray, ref_image: np.ndarray) -> List[np.ndarray]:
-    # Orijinal Hough fonksiyonunuz korunuyor.
-    return []  # Geçici olarak devre dışı, isteğe bağlı olarak etkinleştirilebilir.
+    if len(edges.shape) == 3: edges = cv2.cvtColor(edges, cv2.COLOR_BGR2GRAY)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
+                            minLineLength=max(30, int(0.05 * min(edges.shape[:2]))), maxLineGap=10)
+    if lines is None: return []
+
+    def line_to_abcd(l):
+        x1, y1, x2, y2 = l.ravel(); A = y1 - y2; B = x2 - x1; C = x1 * y2 - x2 * y1; return A, B, C
+
+    def intersect(l1, l2) -> Optional[Tuple[float, float]]:
+        A1, B1, C1 = map(float, line_to_abcd(l1));
+        A2, B2, C2 = map(float, line_to_abcd(l2))
+        M = np.array([[A1, B1], [A2, B2]], dtype=np.float64);
+        b = -np.array([C1, C2], dtype=np.float64)
+        try:
+            x, y = np.linalg.solve(M, b); return float(x), float(y)
+        except np.linalg.LinAlgError:
+            return None
+
+    pts = [p for l1, l2 in combinations(lines, 2) if (p := intersect(l1, l2)) is not None]
+    if len(pts) < 4: return []
+    pts = np.array(pts, dtype=np.float32)
+    H, W = ref_image.shape[:2]
+    pts = pts[(pts[:, 0] >= 0) & (pts[:, 0] < W) & (pts[:, 1] >= 0) & (pts[:, 1] < H)]
+    if pts.shape[0] < 4: return []
+    hull = cv2.convexHull(pts)
+    peri = cv2.arcLength(hull, True)
+    approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+    if len(approx) == 4 and cv2.isContourConvex(approx): return [approx.reshape(4, 2).astype(np.float32)]
+    return []
 
 
 # ---------------------- Scoring (Orijinal) ---------------------- #
-# Orijinal detaylı skorlama fonksiyonlarınızın tümü korunuyor.
+
 def _angle_score(quad: np.ndarray) -> float:
     def angle(pt1, pt2, pt3):
         v1 = pt1 - pt2;
@@ -240,12 +256,12 @@ def _select_best_quad(image: np.ndarray, edge_maps: List[np.ndarray],
     return max(scored, key=lambda item: item[1])[0]
 
 
-# ---------------------- Main Component (Geliştirilmiş) ---------------------- #
+# ---------------------- Main Component (Son Düzeltmelerle) ---------------------- #
 
 class PerspectiveCorrection(Component):
 
-    def __init__(self, config: PackageModel):
-        super().__init__(config)
+    def __init__(self, _id: str, config: PackageModel):
+        super().__init__(_id, config)
 
     @staticmethod
     def bootstrap(config: PackageModel):
@@ -261,19 +277,19 @@ class PerspectiveCorrection(Component):
         mask = _create_document_mask(img_bgr)
         candidates_from_mask = _find_quads_from_contours(mask, img_bgr)
         if candidates_from_mask:
-            # Maskeden gelen adayları, maskenin kendisini yoğunluk haritası olarak kullanarak puanla
             scored_candidates = [(q, _score_quad(q, img_bgr, mask)) for q in candidates_from_mask]
             best_candidate, best_score = max(scored_candidates, key=lambda item: item[1])
 
-            # Belirli bir skor eşiğini geçerse, bu sonucu kabul et
-            if best_score > 0.4:  # Ayarlanabilir bir güven eşiği
+            if best_score > 0.4:
                 warped = _four_point_transform(img_bgr, best_candidate)
                 return Image.from_bgr(warped)
 
         # --- Strateji 2: LAB Renk Uzayı ile Derin Analiz (Yedek Plan) ---
-        edge_maps = _generate_edge_maps(img_bgr)  # Artık LAB tabanlı çalışıyor
+        edge_maps = _generate_edge_maps(img_bgr)
         contour_candidates = [_find_quads_from_contours(e, img_bgr) for e in edge_maps]
-        hough_candidates = []  # Hough'u kullanmak isterseniz bu listeyi doldurun
+        hough_candidates = []
+        for e in edge_maps:
+            hough_candidates.extend(_find_quads_from_hough(e, img_bgr))
 
         best_quad = _select_best_quad(img_bgr, edge_maps, contour_candidates, hough_candidates)
         warped = _four_point_transform(img_bgr, best_quad)

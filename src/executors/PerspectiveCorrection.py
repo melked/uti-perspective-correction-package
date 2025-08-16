@@ -35,41 +35,44 @@ def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     return np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
 
+
 # ---------------------- 2. ÖN İŞLEME ----------------------
 def _preprocess(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
     img = image.copy()
     if method == "bilateral":
         return cv2.bilateralFilter(img, kwargs.get("d", 9), kwargs.get("sigma", 75), kwargs.get("sigma", 75))
     elif method == "gaussian":
-        return cv2.GaussianBlur(img, kwargs.get("ksize", (5,5)), 0)
+        return cv2.GaussianBlur(img, kwargs.get("ksize", (5, 5)), 0)
     elif method == "clahe":
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         return clahe.apply(gray)
     elif method == "gamma":
-        table = np.array([((i/255.0)**kwargs.get("gamma",1.5))*255 for i in range(256)], dtype=np.uint8)
-        img_gamma = cv2.LUT(img, table)
-        return img_gamma
+        table = np.array([((i / 255.0) ** kwargs.get("gamma", 1.5)) * 255 for i in range(256)], dtype=np.uint8)
+        # Gamma renkli veya gri görüntüye uygulanabilir, bu yüzden burada griye çevirmiyoruz.
+        return cv2.LUT(img, table)
     elif method == "unsharp":
-        blur = cv2.GaussianBlur(img, kwargs.get("ksize",(5,5)), 0)
+        blur = cv2.GaussianBlur(img, kwargs.get("ksize", (5, 5)), 0)
         return cv2.addWeighted(img, 1.5, blur, -0.5, 0)
+
+    # --- EKSİK OLAN VE HATAYA NEDEN OLAN BLOK BURASIYDI ---
     elif method == "clahe_gamma_bilateral":
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
-    elif method == "clahe_gamma_bilateral":
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else imgpipe
-        # CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
-        # Gamma düzeltme
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        # 1. CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        processed = clahe.apply(gray)
+        # 2. Gamma Düzeltme
         gamma_val = kwargs.get("gamma", 1.8)
-        table = np.array([((i/255.0)**gamma_val)*255 for i in range(256)], dtype=np.uint8)
-        gray = cv2.LUT(gray, table)
-        # Bilateral filter
-        d = kwargs.get("d", 9)
-        sigma = kwargs.get("sigma", 75)
-        gray = cv2.bilateralFilter(gray, d, sigma, sigma)
-        return gray
+        table = np.array([((i / 255.0) ** gamma_val) * 255 for i in range(256)], dtype=np.uint8)
+        processed = cv2.LUT(processed, table)
+        # 3. Bilateral Filter
+        d_val = kwargs.get("d", 9)
+        sigma_val = kwargs.get("sigma", 75)
+        return cv2.bilateralFilter(processed, d_val, sigma_val, sigma_val)
+    # ----------------------------------------------------
+
     else:
+        # Eğer tanımlı bir metot değilse, orijinal görüntüyü döndür
         return img
 
 # ---------------------- 3. EŞİKLEME VE KENAR TESPİTİ ----------------------

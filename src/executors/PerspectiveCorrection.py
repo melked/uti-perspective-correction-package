@@ -12,7 +12,6 @@ from sdks.novavision.src.helper.executor import Executor
 from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
-
 # ---------------------- 1. GEOMETRİ YARDIMCILARI ----------------------
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
@@ -24,7 +23,6 @@ def _order_points(pts: np.ndarray) -> np.ndarray:
     rect[1], rect[3] = pts[np.argmin(diff)], pts[np.argmax(diff)]
     return rect
 
-
 def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     rect = _order_points(pts)
     (tl, tr, br, bl) = rect
@@ -34,11 +32,9 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (int(width), int(height)), flags=cv2.INTER_LANCZOS4)
 
-
 def _full_image_quad(image: np.ndarray) -> np.ndarray:
     h, w = image.shape[:2]
     return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-
 
 # ---------------------- 2. ÖN İŞLEME ----------------------
 
@@ -51,15 +47,21 @@ def _preprocess(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         return clahe.apply(image)
     elif method == "gamma":
-        table = np.array([((i / 255.0) ** kwargs.get("gamma", 1.5)) * 255 for i in range(256)]).astype("uint8")
+        table = np.array([((i / 255.0) ** kwargs.get("gamma", 1.8)) * 255 for i in range(256)]).astype("uint8")
         img_gamma = cv2.LUT(image, table)
         return cv2.cvtColor(img_gamma, cv2.COLOR_BGR2GRAY)
     elif method == "unsharp":
         blur = cv2.GaussianBlur(image, kwargs.get("ksize", (5, 5)), 0)
         return cv2.addWeighted(image, 1.5, blur, -0.5, 0)
+    elif method == "lab_segment":
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        mask_l = cv2.inRange(l, kwargs.get("l_min", 200), kwargs.get("l_max", 255))
+        mask_a = cv2.inRange(a, kwargs.get("a_min", 0), kwargs.get("a_max", 50))
+        mask_b = cv2.inRange(b, kwargs.get("b_min", 0), kwargs.get("b_max", 50))
+        return cv2.bitwise_or(mask_l, cv2.bitwise_or(mask_a, mask_b))
     else:
-        return image
-
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
 # ---------------------- 3. EŞİKLEME VE KENAR TESPİTİ ----------------------
 
@@ -76,12 +78,11 @@ def _threshold(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
         _, thresh = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         return thresh
     elif method == "inRange":
-        lower = np.array(kwargs.get("lower", [0, 0, 180]), dtype="uint8")
-        upper = np.array(kwargs.get("upper", [180, 30, 255]), dtype="uint8")
+        lower = np.array(kwargs.get("lower", [0,0,180]), dtype="uint8")
+        upper = np.array(kwargs.get("upper", [180,30,255]), dtype="uint8")
         return cv2.inRange(image, lower, upper)
     else:
         return image
-
 
 # ---------------------- 4. MORFOLOJİK İŞLEMLER ----------------------
 
@@ -97,7 +98,6 @@ def _morphology(mask: np.ndarray, op: str = "close", ksize=(5,5), iterations: in
     else:
         return mask
 
-
 # ---------------------- 5. KONTUR VE DÖRTGEN BULMA ----------------------
 
 def _find_quads(mask: np.ndarray, min_area_ratio: float = 0.05) -> List[np.ndarray]:
@@ -108,44 +108,50 @@ def _find_quads(mask: np.ndarray, min_area_ratio: float = 0.05) -> List[np.ndarr
         if cv2.contourArea(c) < min_area_ratio * img_area:
             break
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        approx = cv2.approxPolyDP(c, 0.02*peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
             quads.append(approx.reshape(4,2).astype(np.float32))
     return quads
-
 
 # ---------------------- 6. DÖRTGEN SKORLAMA ----------------------
 
 def _score_quad(quad: np.ndarray, img_shape: Tuple[int,int]) -> float:
     area = cv2.contourArea(quad)
-    img_area = img_shape[0] * img_shape[1]
-    area_score = 1.0 if 0.05 < area / img_area < 0.95 else 0.1
+    img_area = img_shape[0]*img_shape[1]
+    area_score = 1.0 if 0.05 < area/img_area < 0.95 else 0.1
 
     ordered = _order_points(quad)
     angles = []
     for i in range(4):
-        p1, p2, p3 = ordered[(i-1)%4], ordered[i], ordered[(i+1)%4]
-        v1, v2 = p1-p2, p3-p2
+        p1,p2,p3 = ordered[(i-1)%4], ordered[i], ordered[(i+1)%4]
+        v1,v2 = p1-p2, p3-p2
         angle = np.degrees(np.arccos(np.dot(v1,v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)+1e-6)))
         angles.append(angle)
-    angle_score = np.mean([1 - abs(a-90)/90 for a in angles])
+    angle_score = np.mean([1-abs(a-90)/90 for a in angles])
 
-    w = (np.linalg.norm(ordered[0]-ordered[1]) + np.linalg.norm(ordered[2]-ordered[3])) / 2
-    h = (np.linalg.norm(ordered[1]-ordered[2]) + np.linalg.norm(ordered[0]-ordered[3])) / 2
-    ratio_score = max(0, 1 - (max(w,h)/min(w,h)-1.4)/5.0)
+    w = (np.linalg.norm(ordered[0]-ordered[1]) + np.linalg.norm(ordered[2]-ordered[3]))/2
+    h = (np.linalg.norm(ordered[1]-ordered[2]) + np.linalg.norm(ordered[0]-ordered[3]))/2
+    ratio_score = max(0, 1-(max(w,h)/min(w,h)-1.4)/5.0)
 
     return area_score*0.4 + angle_score*0.4 + ratio_score*0.2
 
-
-# ---------------------- 7. ANA BİLEŞEN ----------------------
+# ---------------------- 7. PIPELINE TANIMLARI ----------------------
 
 PIPELINES = [
+    # Orijinal ve standart pipeline’lar
     {"name":"sharpen_adaptive","pre":"bilateral","pre_args":{"d":9,"sigma":75},"thresh":"adaptive","thresh_args":{"block":11,"C":2,"invert":True},"morph":"close_open","morph_args":{"ksize":(5,5)}},
     {"name":"clahe_canny","pre":"clahe","pre_args":{},"thresh":"canny","thresh_args":{"th1":50,"th2":150},"morph":"close","morph_args":{"ksize":(5,5)}},
     {"name":"bright_blur_canny","pre":"gamma","pre_args":{"gamma":1.8},"thresh":"canny","thresh_args":{"th1":30,"th2":120},"morph":"close","morph_args":{"ksize":(7,7),"iterations":2}},
     {"name":"inverse_otsu","pre":"gaussian","pre_args":{"ksize":(5,5)},"thresh":"otsu_inv","thresh_args":{},"morph":"close_open","morph_args":{"ksize":(5,5)}},
     {"name":"color_segment_hsv","pre":None,"pre_args":{},"thresh":"inRange","thresh_args":{"lower":[0,0,180],"upper":[180,30,255]},"morph":"close_open","morph_args":{"ksize":(7,7)}},
+
+    # Agresif pipeline’lar karmaşık arka plan için
+    {"name":"clahe_unsharp","pre":"clahe","pre_args":{},"thresh":"adaptive","thresh_args":{"block":11,"C":2,"invert":True},"morph":"close_open","morph_args":{"ksize":(5,5),"iterations":2}},
+    {"name":"gamma_bilateral_unsharp","pre":"gamma","pre_args":{"gamma":1.5},"thresh":"canny","thresh_args":{"th1":20,"th2":120},"morph":"close_open","morph_args":{"ksize":(5,5),"iterations":2}},
+    {"name":"lab_segment_canny","pre":"lab_segment","pre_args":{"l_min":200,"l_max":255,"a_min":0,"a_max":50,"b_min":0,"b_max":50},"thresh":"canny","thresh_args":{"th1":50,"th2":150},"morph":"close_open","morph_args":{"ksize":(5,5),"iterations":2}},
 ]
+
+# ---------------------- 8. ANA BİLEŞEN ----------------------
 
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -159,10 +165,8 @@ class PerspectiveCorrection(Component):
         return {}
 
     def _prepare_image(self, img: np.ndarray) -> np.ndarray:
-        if img is None or img.size == 0:
-            raise ValueError("Input image is empty or None.")
-        if img.dtype != np.uint8:
-            img = cv2.normalize(img,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
+        if img is None or img.size==0: raise ValueError("Input image is empty or None.")
+        if img.dtype != np.uint8: img = cv2.normalize(img,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
         if img.ndim==2: img=cv2.cvtColor(img,cv2.COLOR_GRAY2BGR)
         elif img.shape[-1]==4: img=cv2.cvtColor(img,cv2.COLOR_BGRA2BGR)
         return img
@@ -181,10 +185,18 @@ class PerspectiveCorrection(Component):
             except Exception as e:
                 print(f"Pipeline '{pipe['name']}' hata verdi: {e}")
 
+        # Skor düşükse fallback pipeline (ikinci aşama agresif deneme)
         if not candidates:
-            return _full_image_quad(image), "fallback_full_image", 0.0
-        best = max(candidates, key=lambda c:c["score"])
-        return best["quad"], best["source"], best["score"]
+            fallback_mask = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            fallback_mask = cv2.adaptiveThreshold(fallback_mask,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,11,2)
+            fallback_mask = _morphology(fallback_mask,"close_open",ksize=(5,5),iterations=2)
+            quads = _find_quads(fallback_mask)
+            for q in quads:
+                candidates.append({"quad":q,"source":"fallback","score":0.5})
+
+        if not candidates: return _full_image_quad(image),"full_image",0.0
+        best = max(candidates,key=lambda c:c["score"])
+        return best["quad"],best["source"],best["score"]
 
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
@@ -204,6 +216,5 @@ class PerspectiveCorrection(Component):
 
         return build_response(context=self)
 
-
-# ---------------------- 8. ÇALIŞTIRMA ----------------------
+# ---------------------- 9. ÇALIŞTIRMA ----------------------
 Executor(sys.argv[1]).run()

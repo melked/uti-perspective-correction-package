@@ -49,55 +49,69 @@ def _preprocess(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
         return clahe.apply(gray)
     elif method == "gamma":
         table = np.array([((i / 255.0) ** kwargs.get("gamma", 1.5)) * 255 for i in range(256)], dtype=np.uint8)
-        # Gamma renkli veya gri görüntüye uygulanabilir, bu yüzden burada griye çevirmiyoruz.
         return cv2.LUT(img, table)
     elif method == "unsharp":
         blur = cv2.GaussianBlur(img, kwargs.get("ksize", (5, 5)), 0)
         return cv2.addWeighted(img, 1.5, blur, -0.5, 0)
-
-    # --- EKSİK OLAN VE HATAYA NEDEN OLAN BLOK BURASIYDI ---
     elif method == "clahe_gamma_bilateral":
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-        # 1. CLAHE
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         processed = clahe.apply(gray)
-        # 2. Gamma Düzeltme
         gamma_val = kwargs.get("gamma", 1.8)
         table = np.array([((i / 255.0) ** gamma_val) * 255 for i in range(256)], dtype=np.uint8)
         processed = cv2.LUT(processed, table)
-        # 3. Bilateral Filter
         d_val = kwargs.get("d", 9)
         sigma_val = kwargs.get("sigma", 75)
         return cv2.bilateralFilter(processed, d_val, sigma_val, sigma_val)
-    # ----------------------------------------------------
+
+    # YENİ METODU BURAYA EKLEYİN
+    elif method == "heavy_blur_lab":
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_channel, a, b = cv2.split(lab)
+        blurred_l = cv2.GaussianBlur(l_channel, kwargs.get("ksize", (21, 21)), 0)
+        return blurred_l
 
     else:
-        # Eğer tanımlı bir metot değilse, orijinal görüntüyü döndür
         return img
+
 
 # ---------------------- 3. EŞİKLEME VE KENAR TESPİTİ ----------------------
 def _threshold(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
     img = image.copy()
-    if method in ["adaptive","otsu_inv"]:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
-        if method=="adaptive":
+    if method in ["adaptive", "otsu_inv"]:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        if method == "adaptive":
             return cv2.adaptiveThreshold(
                 gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY_INV if kwargs.get("invert", True) else cv2.THRESH_BINARY,
-                kwargs.get("block",11), kwargs.get("C",2)
+                kwargs.get("block", 11), kwargs.get("C", 2)
             )
-        else: # otsu_inv
+        else:  # otsu_inv
             _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             return thresh
-    elif method=="canny":
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
-        return cv2.Canny(gray, kwargs.get("th1",50), kwargs.get("th2",150))
-    elif method=="inRange":
-        if img.ndim==2:  # griyse BGR’ye çevir
+    elif method == "canny":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        return cv2.Canny(gray, kwargs.get("th1", 50), kwargs.get("th2", 150))
+    elif method == "inRange":
+        if img.ndim == 2:  # griyse BGR’ye çevir
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        lower = np.array(kwargs.get("lower",[0,0,180]), dtype=np.uint8)
-        upper = np.array(kwargs.get("upper",[180,30,255]), dtype=np.uint8)
-        return cv2.inRange(img, lower, upper)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # HSV'ye çevir
+        lower = np.array(kwargs.get("lower", [0, 0, 180]), dtype=np.uint8)
+        upper = np.array(kwargs.get("upper", [180, 30, 255]), dtype=np.uint8)
+        return cv2.inRange(hsv, lower, upper)
+
+    # YENİ METODU BURAYA EKLEYİN
+    elif method == "hough_mask":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        edges = cv2.Canny(gray, 50, 150)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=img.shape[1] // 4, maxLineGap=20)
+        mask = np.zeros_like(edges)
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                cv2.line(mask, (x1, y1), (x2, y2), 255, 5)
+        return mask
+
     else:
         return img
 
@@ -150,18 +164,30 @@ def _score_quad(quad: np.ndarray, img_shape: Tuple[int,int]) -> float:
     return area_score*0.4 + angle_score*0.4 + ratio_score*0.2
 
 # ---------------------- 7. PIPELINE SETİ ----------------------
+# ---------------------- 7. PIPELINE SETİ ----------------------
 PIPELINES = [
+    # --- YENİ EKLENEN GÜÇLÜ PIPELINE'LAR ---
+    {"name": "hough_mask", "pre": "clahe", "pre_args": {}, "thresh": "hough_mask", "thresh_args": {},
+     "morph": "close", "morph_args": {"ksize": (15, 15), "iterations": 2}},
+
+    {"name": "heavy_blur_lab_otsu", "pre": "heavy_blur_lab", "pre_args": {"ksize": (21, 21)}, "thresh": "otsu_inv",
+     "thresh_args": {}, "morph": "close", "morph_args": {"ksize": (9, 9)}},
+
+    # --- Mevcut Pipeline'larınız ---
     {"name": "aggressive_clahe_gamma_bilateral_canny", "pre": "clahe_gamma_bilateral",
      "pre_args": {"gamma": 1.8, "d": 9, "sigma": 75}, "thresh": "canny", "thresh_args": {"th1": 30, "th2": 120},
      "morph": "close_open", "morph_args": {"ksize": (7, 7), "iterations": 2}},
-    {"name":"aggressive_clahe_gamma_bilateral_canny","pre":"clahe_gamma_bilateral","pre_args":{"gamma":1.8,"d":9,"sigma":75},"thresh":"canny","thresh_args":{"th1":30,"th2":120},"morph":"close_open","morph_args":{"ksize":(5,5),"iterations":2}},
-    {"name":"sharpen_adaptive","pre":"bilateral","pre_args":{"d":9,"sigma":75},"thresh":"adaptive","thresh_args":{"block":11,"C":2,"invert":True},"morph":"close_open","morph_args":{"ksize":(5,5)}},
-    {"name":"clahe_canny","pre":"clahe","pre_args":{},"thresh":"canny","thresh_args":{"th1":50,"th2":150},"morph":"close","morph_args":{"ksize":(5,5)}},
-    {"name":"gamma_bilateral_unsharp","pre":"gamma","pre_args":{"gamma":1.8},"thresh":"canny","thresh_args":{"th1":30,"th2":120},"morph":"close","morph_args":{"ksize":(7,7),"iterations":2}},
-    {"name":"inverse_otsu","pre":"gaussian","pre_args":{"ksize":(5,5)},"thresh":"otsu_inv","thresh_args":{},"morph":"close_open","morph_args":{"ksize":(5,5)}},
-    {"name":"color_segment_hsv","pre":None,"pre_args":{},"thresh":"inRange","thresh_args":{"lower":[0,0,180],"upper":[180,30,255]},"morph":"close_open","morph_args":{"ksize":(7,7)}},
+    {"name": "sharpen_adaptive", "pre": "bilateral", "pre_args": {"d": 9, "sigma": 75}, "thresh": "adaptive",
+     "thresh_args": {"block": 11, "C": 2, "invert": True}, "morph": "close_open",
+     "morph_args": {"ksize": (5, 5)}},
+    {"name": "clahe_canny", "pre": "clahe", "pre_args": {}, "thresh": "canny",
+     "thresh_args": {"th1": 50, "th2": 150}, "morph": "close", "morph_args": {"ksize": (5, 5)}},
+    {"name": "inverse_otsu", "pre": "gaussian", "pre_args": {"ksize": (5, 5)}, "thresh": "otsu_inv", "thresh_args": {},
+     "morph": "close_open", "morph_args": {"ksize": (5, 5)}},
+    {"name": "color_segment_hsv", "pre": None, "pre_args": {}, "thresh": "inRange",
+     "thresh_args": {"lower": [0, 0, 180], "upper": [180, 30, 255]}, "morph": "close_open",
+     "morph_args": {"ksize": (7, 7)}},
 ]
-
 # ---------------------- 8. ANA BİLEŞEN ----------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):

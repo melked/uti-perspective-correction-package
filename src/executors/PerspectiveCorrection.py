@@ -53,6 +53,20 @@ def _preprocess(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
     elif method == "unsharp":
         blur = cv2.GaussianBlur(img, kwargs.get("ksize",(5,5)), 0)
         return cv2.addWeighted(img, 1.5, blur, -0.5, 0)
+    elif method == "clahe_gamma_bilateral":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+        # CLAHE
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+        # Gamma düzeltme
+        gamma_val = kwargs.get("gamma", 1.8)
+        table = np.array([((i/255.0)**gamma_val)*255 for i in range(256)], dtype=np.uint8)
+        gray = cv2.LUT(gray, table)
+        # Bilateral filter
+        d = kwargs.get("d", 9)
+        sigma = kwargs.get("sigma", 75)
+        gray = cv2.bilateralFilter(gray, d, sigma, sigma)
+        return gray
     else:
         return img
 
@@ -132,6 +146,7 @@ def _score_quad(quad: np.ndarray, img_shape: Tuple[int,int]) -> float:
 
 # ---------------------- 7. PIPELINE SETİ ----------------------
 PIPELINES = [
+    {"name":"aggressive_clahe_gamma_bilateral_canny","pre":"clahe_gamma_bilateral","pre_args":{"gamma":1.8,"d":9,"sigma":75},"thresh":"canny","thresh_args":{"th1":30,"th2":120},"morph":"close_open","morph_args":{"ksize":(5,5),"iterations":2}},
     {"name":"sharpen_adaptive","pre":"bilateral","pre_args":{"d":9,"sigma":75},"thresh":"adaptive","thresh_args":{"block":11,"C":2,"invert":True},"morph":"close_open","morph_args":{"ksize":(5,5)}},
     {"name":"clahe_canny","pre":"clahe","pre_args":{},"thresh":"canny","thresh_args":{"th1":50,"th2":150},"morph":"close","morph_args":{"ksize":(5,5)}},
     {"name":"gamma_bilateral_unsharp","pre":"gamma","pre_args":{"gamma":1.8},"thresh":"canny","thresh_args":{"th1":30,"th2":120},"morph":"close","morph_args":{"ksize":(7,7),"iterations":2}},

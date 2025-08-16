@@ -194,14 +194,17 @@ def _find_quads_from_hough(edges: np.ndarray,
         return A, B, C
 
     def intersect(l1, l2) -> Optional[Tuple[float, float]]:
-        A1, B1, C1 = line_to_abcd(l1)
-        A2, B2, C2 = line_to_abcd(l2)
-        denom = A1 * B2 - A2 * B1
-        if abs(denom) < 1e-6:
-            return None
-        x = (B1 * C2 - B2 * C1) / denom
-        y = (C1 * A2 - C2 * A1) / denom
-        return x, y
+        A1, B1, C1 = map(float, line_to_abcd(l1))
+        A2, B2, C2 = map(float, line_to_abcd(l2))
+
+        M = np.array([[A1, B1], [A2, B2]], dtype=np.float64)
+        b = -np.array([C1, C2], dtype=np.float64)
+
+        try:
+            x, y = np.linalg.solve(M, b)
+            return float(x), float(y)
+        except np.linalg.LinAlgError:
+            return None  # doğrular paralel ya da neredeyse paralel
 
     pts = []
     for l1 in g1:

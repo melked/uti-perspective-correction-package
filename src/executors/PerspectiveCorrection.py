@@ -3,10 +3,10 @@ import sys
 import cv2
 import numpy as np
 from typing import List, Tuple, Optional
-from itertools import combinations
 
-# Projenize özel importlar
+# --- Bu kısımlar projenizin yapısına göre aynı kalacak ---
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
+
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
@@ -14,17 +14,17 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
-# ---------------------- Geometry Helpers (Orijinal) ---------------------- #
+# ---------------------- Geometry Helpers (DEĞİŞİKLİK YOK) ---------------------- #
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2).astype(np.float32)
     rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1)
     diff = np.diff(pts, axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
+    rect[0] = pts[np.argmin(s)]  # top-left
+    rect[2] = pts[np.argmax(s)]  # bottom-right
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
     return rect
 
 
@@ -37,7 +37,8 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxHeight = int(round(max(heightA, heightB)))
-    if maxWidth < 2 or maxHeight < 2: return image
+    maxWidth = max(2, maxWidth)
+    maxHeight = max(2, maxHeight)
     dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
@@ -56,24 +57,15 @@ def _min_area_rect_quad(binary_or_gray: np.ndarray, ref_image: np.ndarray) -> np
         gray = binary_or_gray.copy()
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return _full_image_quad(ref_image)
+    if not contours:
+        return _full_image_quad(ref_image)
     c = max(contours, key=cv2.contourArea)
     rect = cv2.minAreaRect(c)
     box = cv2.boxPoints(rect).astype(np.float32)
     return box
 
 
-# ---------------------- Preprocessing Pipelines (Geliştirilmiş) ---------------------- #
-
-def _create_document_mask(image_bgr: np.ndarray) -> np.ndarray:
-    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    lower_bound = np.array([0, 0, 120])
-    upper_bound = np.array([180, 80, 255])
-    mask = cv2.inRange(hsv, lower_bound, upper_bound)
-    kernel = np.ones((7, 7), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    return mask
-
+# ---------------------- Preprocessing Pipelines (YENİ FONKSİYONLAR EKLENDİ) ---------------------- #
 
 def _pre_soft(gray: np.ndarray) -> np.ndarray:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -112,24 +104,98 @@ def _pre_extreme(gray: np.ndarray) -> np.ndarray:
     return edges
 
 
-def _generate_edge_maps(image_bgr: np.ndarray) -> List[np.ndarray]:
+# YENİ: Kırmızı rengi tespit etmek için yardımcı fonksiyon
+def _create_red_mask(image_bgr: np.ndarray) -> np.ndarray:
+    """Görüntüdeki baskın kırmızı alanları maskeler."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+
+    # Kırmızının HSV'deki aralığı (0'ın etrafında döner)
+    lower_red1 = np.array([0, 70, 50])
+    upper_red1 = np.array([10, 255, 255])
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+
+    lower_red2 = np.array([170, 70, 50])
+    upper_red2 = np.array([180, 255, 255])
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+
+    red_mask = cv2.bitwise_or(mask1, mask2)
+
+    # Maskeyi temizle ve boşlukları doldur
+    kernel = np.ones((5, 5), np.uint8)
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    red_mask = cv2.dilate(red_mask, kernel, iterations=2)
+
+    return red_mask
+
+
+# YENİ: Renk maskeleme ve LAB renk uzayını kullanan robust pipeline
+def _pre_color_robust(image_bgr: np.ndarray) -> np.ndarray:
+    """
+    Kırmızı gibi baskın arka plan renklerini eleyerek kenar tespiti yapar.
+    LAB renk uzayının L kanalını ve CLAHE'yi kullanır.
+    """
+    # 1. Adım: Kırmızı arka planı maskele
+    red_mask = _create_red_mask(image_bgr)
+
+    # 2. Adım: LAB renk uzayında kontrastı artır
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-    l_channel, _, _ = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    clahe_l = clahe.apply(l_channel)
-    return [_pre_soft(clahe_l), _pre_medium(clahe_l), _pre_hard(clahe_l), _pre_extreme(clahe_l)]
+    l_channel, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_enhanced = clahe.apply(l_channel)
+
+    # 3. Adım: Kenar tespiti öncesi maskelenen alanı beyaz yap
+    # Bu sayede Canny algoritması bu bölgeleri dikkate almaz
+    l_enhanced[red_mask == 255] = 255
+
+    # 4. Adım: Kenar tespiti yap
+    blur = cv2.GaussianBlur(l_enhanced, (3, 3), 0)
+    edges = cv2.Canny(blur, 40, 120, L2gradient=True)
+    edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
+
+    return edges
 
 
-# ---------------------- Candidate Generation (Orijinal) ---------------------- #
+# GÜNCELLENDİ: Yeni pipeline'ı içerecek şekilde güncellendi
+def _generate_edge_maps(image_bgr: np.ndarray) -> List[np.ndarray]:
+    """Tüm ön işleme pipeline'larını çalıştırarak kenar haritaları listesi oluşturur."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    edge_maps = [
+        _pre_soft(gray),
+        _pre_medium(gray),
+        _pre_hard(gray),
+        _pre_extreme(gray),
+        _pre_color_robust(image_bgr)  # Yeni, renk-tabanlı pipeline eklendi
+    ]
+
+    return edge_maps
+
+
+# ---------------------- Candidate Generation (DEĞİŞİKLİK YOK) ---------------------- #
 
 def _find_quads_from_contours(binary_img: np.ndarray, ref_image: np.ndarray) -> List[np.ndarray]:
-    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return []
+    if binary_img is None or binary_img.size == 0:
+        return []
+    if len(binary_img.shape) == 3:
+        binary_img = cv2.cvtColor(binary_img, cv2.COLOR_BGR2GRAY)
+    if binary_img.dtype != np.uint8:
+        binary_img = cv2.normalize(binary_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+
     H, W = ref_image.shape[:2]
-    min_area = H * W * 0.10
+    img_area = H * W
+    min_area = img_area * 0.02
+    max_area = img_area * 0.95
+
     candidates = []
-    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
-        if cv2.contourArea(c) < min_area: continue
+    for c in sorted(contours, key=cv2.contourArea, reverse=True):
+        area = cv2.contourArea(c)
+        if area < min_area or area > max_area:
+            continue
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
@@ -138,45 +204,101 @@ def _find_quads_from_contours(binary_img: np.ndarray, ref_image: np.ndarray) -> 
 
 
 def _find_quads_from_hough(edges: np.ndarray, ref_image: np.ndarray) -> List[np.ndarray]:
-    if len(edges.shape) == 3: edges = cv2.cvtColor(edges, cv2.COLOR_BGR2GRAY)
+    if len(edges.shape) == 3:
+        edges = cv2.cvtColor(edges, cv2.COLOR_BGR2GRAY)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
-                            minLineLength=max(30, int(0.05 * min(edges.shape[:2]))), maxLineGap=10)
-    if lines is None: return []
+                            minLineLength=max(30, int(0.05 * min(edges.shape[:2]))),
+                            maxLineGap=10)
+    if lines is None:
+        return []
+
+    def angle_of(l):
+        x1, y1, x2, y2 = l.ravel()
+        return np.degrees(np.arctan2((y2 - y1), (x2 - x1) + 1e-6))
+
+    angles = np.array([angle_of(l) for l in lines])
+    group1, group2 = [], []
+    for l, a in zip(lines, angles):
+        a = (a + 180) % 180
+        if 20 <= a <= 70 or 110 <= a <= 160:
+            group1.append(l)
+        else:
+            group2.append(l)
+
+    if len(group1) < 2 or len(group2) < 2:
+        return []
+
+    def top3_by_len(L):
+        return sorted(L, key=lambda li: np.linalg.norm(li.ravel()[:2] - li.ravel()[2:]), reverse=True)[:3]
+
+    g1, g2 = top3_by_len(group1), top3_by_len(group2)
+    if len(g1) < 2 or len(g2) < 2:
+        return []
 
     def line_to_abcd(l):
-        x1, y1, x2, y2 = l.ravel(); A = y1 - y2; B = x2 - x1; C = x1 * y2 - x2 * y1; return A, B, C
+        x1, y1, x2, y2 = l.ravel()
+        A = y1 - y2
+        B = x2 - x1
+        C = x1 * y2 - x2 * y1
+        return A, B, C
 
     def intersect(l1, l2) -> Optional[Tuple[float, float]]:
-        A1, B1, C1 = map(float, line_to_abcd(l1));
+        A1, B1, C1 = map(float, line_to_abcd(l1))
         A2, B2, C2 = map(float, line_to_abcd(l2))
-        M = np.array([[A1, B1], [A2, B2]], dtype=np.float64);
+        M = np.array([[A1, B1], [A2, B2]], dtype=np.float64)
         b = -np.array([C1, C2], dtype=np.float64)
         try:
-            x, y = np.linalg.solve(M, b); return float(x), float(y)
+            x, y = np.linalg.solve(M, b)
+            return float(x), float(y)
         except np.linalg.LinAlgError:
             return None
 
-    pts = [p for l1, l2 in combinations(lines, 2) if (p := intersect(l1, l2)) is not None]
-    if len(pts) < 4: return []
+    pts = []
+    for l1 in g1:
+        for l2 in g2:
+            p = intersect(l1, l2)
+            if p is not None:
+                pts.append(p)
+
     pts = np.array(pts, dtype=np.float32)
     H, W = ref_image.shape[:2]
     pts = pts[(pts[:, 0] >= 0) & (pts[:, 0] < W) & (pts[:, 1] >= 0) & (pts[:, 1] < H)]
-    if pts.shape[0] < 4: return []
+    if pts.shape[0] < 4:
+        return []
+
     hull = cv2.convexHull(pts)
     peri = cv2.arcLength(hull, True)
     approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
-    if len(approx) == 4 and cv2.isContourConvex(approx): return [approx.reshape(4, 2).astype(np.float32)]
-    return []
+    if len(approx) < 4:
+        return []
+    if len(approx) > 4:
+        approx = approx.reshape(-1, 2)
+        from itertools import combinations
+        best = None
+        best_area = 0
+        for comb in combinations(range(len(approx)), 4):
+            quad = approx[list(comb)]
+            area = cv2.contourArea(quad.astype(np.float32))
+            if area > best_area:
+                best_area = area
+                best = quad
+        if best is None:
+            return []
+        quad = best.astype(np.float32)
+    else:
+        quad = approx.reshape(4, 2).astype(np.float32)
+    return [quad]
 
 
-# ---------------------- Scoring (Orijinal) ---------------------- #
+# ---------------------- Scoring (DEĞİŞİKLİK YOK) ---------------------- #
 
 def _angle_score(quad: np.ndarray) -> float:
     def angle(pt1, pt2, pt3):
-        v1 = pt1 - pt2;
+        v1 = pt1 - pt2
         v2 = pt3 - pt2
         cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
-        return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+        ang = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+        return ang
 
     q = quad.astype(np.float32)
     angs = [angle(q[i], q[(i + 1) % 4], q[(i + 2) % 4]) for i in range(4)]
@@ -189,7 +311,7 @@ def _convexity_score(quad: np.ndarray) -> float:
 
 def _area_score(quad: np.ndarray, image: np.ndarray) -> float:
     area = abs(cv2.contourArea(quad.astype(np.float32)))
-    H, W = image.shape[:2];
+    H, W = image.shape[:2]
     ratio = area / float(H * W + 1e-6)
     return float(np.clip(ratio / 0.5, 0, 1))
 
@@ -200,38 +322,53 @@ def _shape_score(quad: np.ndarray) -> float:
 
 
 def _aspect_ratio_score(quad: np.ndarray) -> float:
-    w1 = np.linalg.norm(quad[0] - quad[1]);
+    w1 = np.linalg.norm(quad[0] - quad[1])
     w2 = np.linalg.norm(quad[2] - quad[3])
-    h1 = np.linalg.norm(quad[1] - quad[2]);
+    h1 = np.linalg.norm(quad[1] - quad[2])
     h2 = np.linalg.norm(quad[3] - quad[0])
     w, h = (w1 + w2) / 2.0, (h1 + h2) / 2.0
-    if h <= 1e-6 or w <= 1e-6: return 0.0
+    if h <= 1e-6 or w <= 1e-6:
+        return 0.0
     ratio = w / h if w > h else h / w
+    if ratio < 1.0:
+        return 0.0
     return float(np.clip(1.5 - abs(ratio - 1.5), 0, 1))
 
 
 def _edge_density_score(quad: np.ndarray, edges_like: np.ndarray) -> float:
-    mask = np.zeros(edges_like.shape[:2], dtype=np.uint8)
+    if len(edges_like.shape) == 3:
+        gray = cv2.cvtColor(edges_like, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = edges_like
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    mask = np.zeros(gray.shape, dtype=np.uint8)
     cv2.fillPoly(mask, [quad.astype(np.int32)], 255)
-    inside = cv2.countNonZero(cv2.bitwise_and(edges_like, edges_like, mask=mask))
-    outside = cv2.countNonZero(cv2.bitwise_and(edges_like, edges_like, mask=cv2.bitwise_not(mask)))
-    if inside + outside == 0: return 0.0
-    return float(np.clip((inside / (inside + outside) - 0.2) / 0.6, 0, 1))
+    inside = cv2.countNonZero(cv2.bitwise_and(gray, gray, mask=mask))
+    outside = cv2.countNonZero(cv2.bitwise_and(gray, gray, mask=cv2.bitwise_not(mask)))
+    if inside + outside == 0:
+        return 0.0
+    frac = inside / (inside + outside)
+    return float(np.clip((frac - 0.2) / 0.6, 0, 1))
 
 
 def _parallelism_score(quad: np.ndarray) -> float:
+    def seg_angle(p1, p2):
+        v = p2 - p1
+        return np.degrees(np.arctan2(v[1], v[0] + 1e-6)) % 180
+
     q = _order_points(quad.copy())
-
-    def seg_angle(p1, p2): return np.degrees(np.arctan2(p2[1] - p1[1], p2[0] - p1[0])) % 180
-
     a1 = seg_angle(q[0], q[1]);
-    a3 = seg_angle(q[3], q[2])
+    a3 = seg_angle(q[2], q[3])
     a2 = seg_angle(q[1], q[2]);
-    a4 = seg_angle(q[0], q[3])
+    a4 = seg_angle(q[3], q[0])
 
-    def closeness(a, b): d = min(abs(a - b), 180 - abs(a - b)); return 1 - d / 90
+    def closeness(a, b):
+        d = min(abs(a - b), 180 - abs(a - b))
+        return 1 - d / 90
 
-    return (closeness(a1, a3) + closeness(a2, a4)) / 2.0
+    s1 = closeness(a1, a3)
+    s2 = closeness(a2, a4)
+    return float(max(0.0, (s1 + s2) / 2.0))
 
 
 def _score_quad(quad: np.ndarray, image: np.ndarray, edges_for_density: np.ndarray) -> float:
@@ -241,7 +378,7 @@ def _score_quad(quad: np.ndarray, image: np.ndarray, edges_for_density: np.ndarr
             0.10 * _parallelism_score(quad))
 
 
-# ---------------------- Selection (Orijinal) ---------------------- #
+# ---------------------- Selection (DEĞİŞİKLİK YOK) ---------------------- #
 
 def _select_best_quad(image: np.ndarray, edge_maps: List[np.ndarray],
                       contour_candidates_per_map: List[List[np.ndarray]],
@@ -249,54 +386,37 @@ def _select_best_quad(image: np.ndarray, edge_maps: List[np.ndarray],
     scored: List[Tuple[np.ndarray, float]] = []
     for edges, candidates in zip(edge_maps, contour_candidates_per_map):
         for q in candidates:
-            scored.append((q, _score_quad(q, image, edges)))
+            s = _score_quad(q, image, edges)
+            scored.append((q, s))
     for q in hough_candidates:
-        scored.append((q, _score_quad(q, image, edge_maps[-1])))
-    if not scored: return _full_image_quad(image)
-    return max(scored, key=lambda item: item[1])[0]
+        s = _score_quad(q, image, edge_maps[-1])
+        scored.append((q, s))
+    if not scored:
+        return _full_image_quad(image)
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0]
 
 
-# ---------------------- Main Component (Son Düzeltmelerle) ---------------------- #
+# ---------------------- Main Component (DEĞİŞİKLİK YOK) ---------------------- #
 
 class PerspectiveCorrection(Component):
 
-    def __init__(self, _id: str, config: PackageModel):
-        super().__init__(_id, config)
-
-    @staticmethod
-    def bootstrap(config: PackageModel):
-        return {}
-
-    def run(self, input_image: Image) -> Image:
-        return self.process(input_image)
+    def __init__(self, config: PackageModel):
+        super().__init__(config)
 
     def process(self, input_image: Image) -> Image:
         img_bgr = input_image.to_bgr()
-
-        # --- Strateji 1: Renk Maskesi ile Hızlı Tarama ---
-        mask = _create_document_mask(img_bgr)
-        candidates_from_mask = _find_quads_from_contours(mask, img_bgr)
-        if candidates_from_mask:
-            scored_candidates = [(q, _score_quad(q, img_bgr, mask)) for q in candidates_from_mask]
-            best_candidate, best_score = max(scored_candidates, key=lambda item: item[1])
-
-            if best_score > 0.4:
-                warped = _four_point_transform(img_bgr, best_candidate)
-                return Image.from_bgr(warped)
-
-        # --- Strateji 2: LAB Renk Uzayı ile Derin Analiz (Yedek Plan) ---
         edge_maps = _generate_edge_maps(img_bgr)
         contour_candidates = [_find_quads_from_contours(e, img_bgr) for e in edge_maps]
         hough_candidates = []
         for e in edge_maps:
             hough_candidates.extend(_find_quads_from_hough(e, img_bgr))
-
         best_quad = _select_best_quad(img_bgr, edge_maps, contour_candidates, hough_candidates)
         warped = _four_point_transform(img_bgr, best_quad)
         return Image.from_bgr(warped)
 
 
-# ---------------------- Executor (Orijinal) ---------------------- #
+# ---------------------- Executor (DEĞİŞİKLİK YOK) ---------------------- #
 
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

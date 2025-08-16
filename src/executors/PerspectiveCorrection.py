@@ -55,6 +55,8 @@ def _preprocess(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
         return cv2.addWeighted(img, 1.5, blur, -0.5, 0)
     elif method == "clahe_gamma_bilateral":
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+    elif method == "clahe_gamma_bilateral":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else imgpipe
         # CLAHE
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         gray = clahe.apply(gray)
@@ -146,6 +148,9 @@ def _score_quad(quad: np.ndarray, img_shape: Tuple[int,int]) -> float:
 
 # ---------------------- 7. PIPELINE SETİ ----------------------
 PIPELINES = [
+    {"name": "aggressive_clahe_gamma_bilateral_canny", "pre": "clahe_gamma_bilateral",
+     "pre_args": {"gamma": 1.8, "d": 9, "sigma": 75}, "thresh": "canny", "thresh_args": {"th1": 30, "th2": 120},
+     "morph": "close_open", "morph_args": {"ksize": (7, 7), "iterations": 2}},
     {"name":"aggressive_clahe_gamma_bilateral_canny","pre":"clahe_gamma_bilateral","pre_args":{"gamma":1.8,"d":9,"sigma":75},"thresh":"canny","thresh_args":{"th1":30,"th2":120},"morph":"close_open","morph_args":{"ksize":(5,5),"iterations":2}},
     {"name":"sharpen_adaptive","pre":"bilateral","pre_args":{"d":9,"sigma":75},"thresh":"adaptive","thresh_args":{"block":11,"C":2,"invert":True},"morph":"close_open","morph_args":{"ksize":(5,5)}},
     {"name":"clahe_canny","pre":"clahe","pre_args":{},"thresh":"canny","thresh_args":{"th1":50,"th2":150},"morph":"close","morph_args":{"ksize":(5,5)}},

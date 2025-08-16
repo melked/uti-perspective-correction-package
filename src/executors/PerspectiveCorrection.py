@@ -30,10 +30,9 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     (tl, tr, br, bl) = rect
     width = max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))
     height = max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))
-    maxWidth, maxHeight = int(round(width)), int(round(height))
-    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype=np.float32)
+    dst = np.array([[0, 0], [int(width) - 1, 0], [int(width) - 1, int(height) - 1], [0, int(height) - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+    return cv2.warpPerspective(image, M, (int(width), int(height)), flags=cv2.INTER_LANCZOS4)
 
 
 def _full_image_quad(image: np.ndarray) -> np.ndarray:
@@ -41,149 +40,112 @@ def _full_image_quad(image: np.ndarray) -> np.ndarray:
     return np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
 
-# ---------------------- 2. PIPELINE KONFIGURASYONLARI ----------------------
+# ---------------------- 2. ÖN İŞLEME ----------------------
 
-PIPELINE_CONFIGS: List[Dict[str, Any]] = [
-    {"name": "sharpen_adaptive",
-     "preprocess": {"type": "bilateral", "d": 9, "sigma": 75},
-     "threshold": {"type": "adaptive", "block": 11, "C": 2, "invert": True},
-     "morphology": {"op": "close_open", "ksize": (5, 5)}},
-
-    {"name": "clahe_canny",
-     "preprocess": {"type": "clahe"},
-     "threshold": {"type": "canny", "th1": 50, "th2": 150},
-     "morphology": {"op": "close", "ksize": (5, 5)}},
-
-    {"name": "bright_blur_canny",
-     "preprocess": {"type": "gamma", "gamma": 1.8},
-     "threshold": {"type": "canny", "th1": 30, "th2": 120},
-     "morphology": {"op": "close", "ksize": (7, 7), "iter": 2}},
-
-    {"name": "inverse_otsu",
-     "preprocess": {"type": "gaussian", "ksize": (5, 5)},
-     "threshold": {"type": "otsu_inv"},
-     "morphology": {"op": "close_open", "ksize": (5, 5)}},
-
-    {"name": "color_segment_hsv",
-     "color_space": "hsv",
-     "threshold": {"type": "inRange", "lower": [0, 0, 180], "upper": [180, 30, 255]},
-     "morphology": {"op": "close_open", "ksize": (7, 7)}},
-
-    {"name": "super_aggressive",
-     "preprocess": {"type": "clahe_gamma_unsharp"},
-     "threshold": {"type": "canny_adaptive", "th1": 20, "th2": 100, "adaptive_factor": 0.8},
-     "morphology": {"op": "dilate_close_open", "ksize": (7, 7), "iter": 2}}
-]
-
-
-# ---------------------- 3. GÖRÜNTÜ İŞLEME ----------------------
-
-def _process_pipeline(image: np.ndarray, config: Dict[str, Any]) -> Optional[np.ndarray]:
-    # Renk uzayı
-    if config.get("color_space") == "hsv":
-        proc_img = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    else:
-        proc_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # Ön işlem
-    pre = config.get("preprocess", {})
-    ptype = pre.get("type")
-    if ptype == "bilateral":
-        proc_img = cv2.bilateralFilter(proc_img, pre["d"], pre["sigma"], pre["sigma"])
-    elif ptype == "gaussian":
-        proc_img = cv2.GaussianBlur(proc_img, pre["ksize"], 0)
-    elif ptype == "clahe":
+def _preprocess(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
+    if method == "bilateral":
+        return cv2.bilateralFilter(image, kwargs.get("d", 9), kwargs.get("sigma", 75), kwargs.get("sigma", 75))
+    elif method == "gaussian":
+        return cv2.GaussianBlur(image, kwargs.get("ksize", (5, 5)), 0)
+    elif method == "clahe":
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        proc_img = clahe.apply(proc_img)
-    elif ptype == "gamma":
-        table = np.array([((i / 255.0) ** pre["gamma"]) * 255 for i in np.arange(256)]).astype("uint8")
-        proc_img = cv2.LUT(image, table)
-        proc_img = cv2.cvtColor(proc_img, cv2.COLOR_BGR2GRAY)
-    elif ptype == "clahe_gamma_unsharp":
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        clahe_img = clahe.apply(gray)
-        gamma = np.power(clahe_img / 255.0, 0.7) * 255
-        gamma = gamma.astype(np.uint8)
-        blur = cv2.GaussianBlur(gamma, (3, 3), 0)
-        proc_img = cv2.addWeighted(gamma, 1.8, blur, -0.8, 0)
+        return clahe.apply(image)
+    elif method == "gamma":
+        table = np.array([((i / 255.0) ** kwargs.get("gamma", 1.5)) * 255 for i in range(256)]).astype("uint8")
+        img_gamma = cv2.LUT(image, table)
+        return cv2.cvtColor(img_gamma, cv2.COLOR_BGR2GRAY)
+    elif method == "unsharp":
+        blur = cv2.GaussianBlur(image, kwargs.get("ksize", (5, 5)), 0)
+        return cv2.addWeighted(image, 1.5, blur, -0.5, 0)
+    else:
+        return image
 
-    # Threshold
-    thresh = config.get("threshold", {})
-    ttype = thresh.get("type")
-    binary_mask = None
-    if ttype == "adaptive":
-        method = cv2.THRESH_BINARY_INV if thresh.get("invert", True) else cv2.THRESH_BINARY
-        binary_mask = cv2.adaptiveThreshold(proc_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, method,
-                                            thresh["block"], thresh["C"])
-    elif ttype == "canny":
-        binary_mask = cv2.Canny(proc_img, thresh["th1"], thresh["th2"])
-    elif ttype == "otsu_inv":
-        _, binary_mask = cv2.threshold(proc_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    elif ttype == "inRange":
-        lower = np.array(thresh["lower"], dtype="uint8")
-        upper = np.array(thresh["upper"], dtype="uint8")
-        binary_mask = cv2.inRange(proc_img, lower, upper)
-    elif ttype == "canny_adaptive":
-        edges = cv2.Canny(proc_img, thresh["th1"], thresh["th2"])
-        median_val = np.median(proc_img)
-        factor = thresh.get("adaptive_factor", 1.0)
-        _, adapt_mask = cv2.threshold(proc_img, int(median_val * factor), 255, cv2.THRESH_BINARY)
-        binary_mask = cv2.bitwise_or(edges, adapt_mask)
 
-    if binary_mask is None: return None
+# ---------------------- 3. EŞİKLEME VE KENAR TESPİTİ ----------------------
 
-    # Morfoloji
-    morph = config.get("morphology", {})
-    if "ksize" in morph:
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, morph["ksize"])
-        iters = morph.get("iter", 1)
-        op = morph["op"]
-        if op == "close":
-            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel, iterations=iters)
-        elif op == "close_open":
-            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel, iterations=iters)
-            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel, iterations=iters)
-        elif op == "dilate_close_open":
-            binary_mask = cv2.dilate(binary_mask, kernel, iterations=1)
-            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel, iterations=iters)
-            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel, iterations=iters)
+def _threshold(image: np.ndarray, method: str, **kwargs) -> np.ndarray:
+    if method == "adaptive":
+        return cv2.adaptiveThreshold(
+            image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV if kwargs.get("invert", True) else cv2.THRESH_BINARY,
+            kwargs.get("block", 11), kwargs.get("C", 2)
+        )
+    elif method == "canny":
+        return cv2.Canny(image, kwargs.get("th1", 50), kwargs.get("th2", 150))
+    elif method == "otsu_inv":
+        _, thresh = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        return thresh
+    elif method == "inRange":
+        lower = np.array(kwargs.get("lower", [0, 0, 180]), dtype="uint8")
+        upper = np.array(kwargs.get("upper", [180, 30, 255]), dtype="uint8")
+        return cv2.inRange(image, lower, upper)
+    else:
+        return image
 
-    # Konturdan dörtgen
-    contours, _ = cv2.findContours(binary_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
-    img_area = image.shape[0] * image.shape[1]
-    min_area = img_area * 0.05
+
+# ---------------------- 4. MORFOLOJİK İŞLEMLER ----------------------
+
+def _morphology(mask: np.ndarray, op: str = "close", ksize=(5,5), iterations: int = 1) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, ksize)
+    if op == "close":
+        return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+    elif op == "open":
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=iterations)
+    elif op == "close_open":
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=iterations)
+    else:
+        return mask
+
+
+# ---------------------- 5. KONTUR VE DÖRTGEN BULMA ----------------------
+
+def _find_quads(mask: np.ndarray, min_area_ratio: float = 0.05) -> List[np.ndarray]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    quads = []
+    img_area = mask.shape[0] * mask.shape[1]
     for c in sorted(contours, key=cv2.contourArea, reverse=True):
-        if cv2.contourArea(c) < min_area: break
+        if cv2.contourArea(c) < min_area_ratio * img_area:
+            break
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
-            return approx.reshape(4, 2).astype(np.float32)
-    return None
+            quads.append(approx.reshape(4,2).astype(np.float32))
+    return quads
 
 
-# ---------------------- 4. SKORLAMA ----------------------
+# ---------------------- 6. DÖRTGEN SKORLAMA ----------------------
 
-def _score_quad(quad: np.ndarray, shape: Tuple[int, int]) -> float:
-    area = abs(cv2.contourArea(quad))
-    img_area = shape[0] * shape[1]
+def _score_quad(quad: np.ndarray, img_shape: Tuple[int,int]) -> float:
+    area = cv2.contourArea(quad)
+    img_area = img_shape[0] * img_shape[1]
     area_score = 1.0 if 0.05 < area / img_area < 0.95 else 0.1
+
     ordered = _order_points(quad)
     angles = []
     for i in range(4):
-        p1, p2, p3 = ordered[(i - 1) % 4], ordered[i], ordered[(i + 1) % 4]
-        v1, v2 = p1 - p2, p3 - p2
-        angle = np.degrees(np.arccos(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)))
+        p1, p2, p3 = ordered[(i-1)%4], ordered[i], ordered[(i+1)%4]
+        v1, v2 = p1-p2, p3-p2
+        angle = np.degrees(np.arccos(np.dot(v1,v2)/(np.linalg.norm(v1)*np.linalg.norm(v2)+1e-6)))
         angles.append(angle)
-    angle_score = np.mean([1 - abs(a - 90) / 90 for a in angles])
-    w = (np.linalg.norm(ordered[0] - ordered[1]) + np.linalg.norm(ordered[2] - ordered[3])) / 2
-    h = (np.linalg.norm(ordered[1] - ordered[2]) + np.linalg.norm(ordered[0] - ordered[3])) / 2
-    ratio_score = max(0, 1 - (max(w, h) / (min(w, h) + 1e-6) - 1.4) / 5.0)
-    return area_score * 0.4 + angle_score * 0.4 + ratio_score * 0.2
+    angle_score = np.mean([1 - abs(a-90)/90 for a in angles])
+
+    w = (np.linalg.norm(ordered[0]-ordered[1]) + np.linalg.norm(ordered[2]-ordered[3])) / 2
+    h = (np.linalg.norm(ordered[1]-ordered[2]) + np.linalg.norm(ordered[0]-ordered[3])) / 2
+    ratio_score = max(0, 1 - (max(w,h)/min(w,h)-1.4)/5.0)
+
+    return area_score*0.4 + angle_score*0.4 + ratio_score*0.2
 
 
-# ---------------------- 5. COMPONENT ----------------------
+# ---------------------- 7. ANA BİLEŞEN ----------------------
+
+PIPELINES = [
+    {"name":"sharpen_adaptive","pre":"bilateral","pre_args":{"d":9,"sigma":75},"thresh":"adaptive","thresh_args":{"block":11,"C":2,"invert":True},"morph":"close_open","morph_args":{"ksize":(5,5)}},
+    {"name":"clahe_canny","pre":"clahe","pre_args":{},"thresh":"canny","thresh_args":{"th1":50,"th2":150},"morph":"close","morph_args":{"ksize":(5,5)}},
+    {"name":"bright_blur_canny","pre":"gamma","pre_args":{"gamma":1.8},"thresh":"canny","thresh_args":{"th1":30,"th2":120},"morph":"close","morph_args":{"ksize":(7,7),"iterations":2}},
+    {"name":"inverse_otsu","pre":"gaussian","pre_args":{"ksize":(5,5)},"thresh":"otsu_inv","thresh_args":{},"morph":"close_open","morph_args":{"ksize":(5,5)}},
+    {"name":"color_segment_hsv","pre":None,"pre_args":{},"thresh":"inRange","thresh_args":{"lower":[0,0,180],"upper":[180,30,255]},"morph":"close_open","morph_args":{"ksize":(7,7)}},
+]
 
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -197,46 +159,51 @@ class PerspectiveCorrection(Component):
         return {}
 
     def _prepare_image(self, img: np.ndarray) -> np.ndarray:
-        if img is None or img.size == 0: raise ValueError("Input image empty")
+        if img is None or img.size == 0:
+            raise ValueError("Input image is empty or None.")
         if img.dtype != np.uint8:
-            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[-1] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            img = cv2.normalize(img,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
+        if img.ndim==2: img=cv2.cvtColor(img,cv2.COLOR_GRAY2BGR)
+        elif img.shape[-1]==4: img=cv2.cvtColor(img,cv2.COLOR_BGRA2BGR)
         return img
 
-    def _find_best_quad(self, img: np.ndarray) -> Tuple[np.ndarray, str, float]:
-        candidates = []
-        for cfg in PIPELINE_CONFIGS:
+    def _find_best_quad(self, image: np.ndarray) -> Tuple[np.ndarray,str,float]:
+        candidates=[]
+        for pipe in PIPELINES:
             try:
-                quad = _process_pipeline(img, cfg)
-                if quad is not None:
-                    score = _score_quad(quad, img.shape)
-                    candidates.append({"quad": quad, "source": cfg["name"], "score": score})
+                proc = _preprocess(image, pipe["pre"], **pipe["pre_args"]) if pipe["pre"] else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                thresh = _threshold(proc, pipe["thresh"], **pipe["thresh_args"])
+                mask = _morphology(thresh, pipe["morph"], **pipe["morph_args"])
+                quads = _find_quads(mask)
+                for q in quads:
+                    score = _score_quad(q, image.shape)
+                    candidates.append({"quad":q,"source":pipe["name"],"score":score})
             except Exception as e:
-                print(f"Pipeline {cfg['name']} hata: {e}")
+                print(f"Pipeline '{pipe['name']}' hata verdi: {e}")
+
         if not candidates:
-            return _full_image_quad(img), "fallback_full_image", 0.0
-        best = max(candidates, key=lambda c: c["score"])
+            return _full_image_quad(image), "fallback_full_image", 0.0
+        best = max(candidates, key=lambda c:c["score"])
         return best["quad"], best["source"], best["score"]
 
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         src_img = self._prepare_image(img_obj.value)
+
         best_quad, source, score = self._find_best_quad(src_img)
-        print(f"En iyi pipeline: {source} ({score:.2f})")
+        print(f"En iyi aday '{source}' pipeline'ından {score:.2f} skorla bulundu.")
+
         warped = _four_point_transform(src_img, best_quad)
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
-        self.context.update({
-            "src_quad": best_quad.tolist(),
-            "output_size": [warped.shape[1], warped.shape[0]],
-            "best_pipeline": source,
-            "confidence_score": score
-        })
+
+        self.context["src_quad"] = best_quad.tolist()
+        self.context["output_size"] = [warped.shape[1], warped.shape[0]]
+        self.context["best_pipeline"] = source
+        self.context["confidence_score"] = score
+
         return build_response(context=self)
 
 
-# ---------------------- 6. ÇALIŞTIRMA ----------------------
+# ---------------------- 8. ÇALIŞTIRMA ----------------------
 Executor(sys.argv[1]).run()

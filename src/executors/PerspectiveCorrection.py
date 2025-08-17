@@ -2,8 +2,8 @@ import os
 import sys
 import cv2
 import numpy as np
-import math
-from typing import Optional
+
+from typing import Optional, Tuple
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -15,123 +15,115 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Yok)
+# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Gerekmiyor)
 # -----------------------------------------------------------------------------
+# Bu fonksiyonlar standart ve görev için gerekli. Olduğu gibi kalabilirler.
+
 def _order_points(pts: np.ndarray) -> np.ndarray:
+    """
+    Köşe noktalarını [sol-üst, sağ-üst, sağ-alt, sol-alt] sırasına dizer.
+    """
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1);
-    rect[0] = pts[np.argmin(s)];
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1);
-    rect[1] = pts[np.argmin(diff)];
-    rect[3] = pts[np.argmax(diff)]
+
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]  # Sol-üst köşe en küçük toplama sahiptir
+    rect[2] = pts[np.argmax(s)]  # Sağ-alt köşe en büyük toplama sahiptir
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # Sağ-üst köşe en küçük farka sahiptir
+    rect[3] = pts[np.argmax(diff)]  # Sol-alt köşe en büyük farka sahiptir
+
     return rect
 
 
 def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """
+    Verilen 4 köşe noktasına göre görüntünün perspektifini düzeltir.
+    """
     rect = _order_points(pts)
     (tl, tr, br, bl) = rect
-    widthA = np.linalg.norm(br - bl);
+
+    # Çıktı görüntüsünün genişliğini hesapla
+    widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
-    heightA = np.linalg.norm(tr - br);
+    maxWidth = max(int(widthA), int(widthB))
+
+    # Çıktı görüntüsünün yüksekliğini hesapla
+    heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
-    maxWidth = max(int(widthA), int(widthB));
     maxHeight = max(int(heightA), int(heightB))
-    if maxWidth == 0 or maxHeight == 0: return None
-    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+
+    # Hedef köşe noktalarını belirle (düzleştirilmiş görüntü)
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
+    # Perspektif dönüşüm matrisini hesapla ve uygula
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+
+    return warped
 
 
 # -----------------------------------------------------------------------------
-# UZMAN STRATEJİLERİ
+# 2. Güçlendirilmiş Tek Adımlı Belge Tespiti
 # -----------------------------------------------------------------------------
 
-# UZMAN 1: Hızlı Gözcü (Değişiklik Yok)
-def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
+def find_document_contour(image: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Bir görüntüdeki en büyük, dört köşeli belge benzeri nesnenin konturunu bulur.
+
+    Bu fonksiyon, sadeleştirilmiş ve robust bir işlem hattı kullanır:
+    Gri Tonlama -> Gaussian Blur -> Canny Kenar Tespiti -> Kontur Bulma -> Şekil Yaklaşımı
+    """
+    # Görüntü alanının %20'sinden küçük konturları göz ardı etmek için bir eşik belirle
+    min_area_ratio = 0.2
+    img_area = image.shape[0] * image.shape[1]
+
+    # Adım 1: Ön İşleme
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Gürültüyü azaltmak ve dokuyu yumuşatmak için Gaussian Blur uygula
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Adım 2: Kenar Tespiti
+    # Canny kenar tespiti, belgenin ana hatlarını ortaya çıkarır
     edged = cv2.Canny(blurred, 75, 200)
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) > (image.shape[0] * image.shape[1] * 0.2):
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                return approx.reshape(4, 2).astype(np.float32)
+
+    # Adım 3: Kontur Bulma
+    # Kenar haritasındaki tüm kapalı şekilleri (konturları) bul
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    # Konturları alana göre büyükten küçüğe sırala
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    # Adım 4: En Olası Konturu Bul
+    # En büyük konturları gezerek 4 köşeli olanı ara
+    for c in contours:
+        # Alan kontrolü: Çok küçük konturları atla
+        if cv2.contourArea(c) < img_area * min_area_ratio:
+            break
+
+        peri = cv2.arcLength(c, True)
+        # Konturu daha basit bir çokgene yaklaştır (approximate)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+        # Eğer yaklaştırılan şeklin 4 köşesi varsa, bu bizim belgemizdir
+        if len(approx) == 4:
+            return approx.reshape(4, 2).astype(np.float32)
+
     return None
 
 
-# UZMAN 2: Sınır Gözcüsü (YENİ VE GÜÇLENDİRİLMİŞ UZMAN)
-def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # 1. Arka planı tahmin etmek için çok güçlü bulanıklaştırma
-    # Kernel boyutu ne kadar büyük olursa, o kadar çok detay kaybolur ve geriye sadece ana aydınlatma kalır.
-    kernel_size = int(min(image.shape[:2]) / 5)
-    if kernel_size % 2 == 0: kernel_size += 1  # Kernel tek sayı olmalı
-    blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-
-    # 2. Arka planı "çıkartarak" aydınlatmayı düzle ve sınırları ortaya çıkar
-    # cv2.divide, gölgeleri ve parlamaları gidermede çok etkilidir
-    flattened = cv2.divide(gray, blurred_bg, scale=255)
-
-    # 3. Geriye kalan sınırlardan bir maske oluştur
-    _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # 4. Maskeyi temizle ve sağlamlaştır
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=5)
-
-    # 5. Temizlenmiş sınırdan en büyük dörtgeni bul
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) > (image.shape[0] * image.shape[1] * 0.1):
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                return approx.reshape(4, 2).astype(np.float32)
-    return None
-
-
-# UZMAN 3: Renk Avcısı (Değişiklik Yok)
-def stage3_color_clustering(image: np.ndarray) -> Optional[np.ndarray]:
-    h, w = image.shape[:2]
-    scale = 400 / max(h, w)
-    small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    pixels = small_img.reshape((-1, 3)).astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, centers = cv2.kmeans(pixels, 4, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-    centers = centers.astype(np.uint8)
-    lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
-    luminance = [c[0] for c in lab_centers];
-    counts = np.bincount(labels.flatten())
-    best_cluster_idx = -1;
-    max_score = -1
-    for i in range(len(centers)):
-        if luminance[i] < 60: continue
-        score = luminance[i] * counts[i]
-        if score > max_score: max_score, best_cluster_idx = score, i
-    if best_cluster_idx == -1: best_cluster_idx = np.argmax(counts)
-    mask = (labels.reshape(small_img.shape[:2]) == best_cluster_idx).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
-    c = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(c) < w * h * 0.1: return None
-    rect = cv2.minAreaRect(c)
-    box = cv2.boxPoints(rect)
-    return box.astype(np.float32)
-
-
 # -----------------------------------------------------------------------------
-# Ana Bileşen
+# 3. Ana Bileşen
 # -----------------------------------------------------------------------------
+
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
@@ -144,8 +136,10 @@ class PerspectiveCorrection(Component):
         return {}
 
     def _prepare_image(self, img: np.ndarray) -> np.ndarray:
-        if img is None or img.size == 0: raise ValueError("Input image is empty or None.")
-        if img.dtype != np.uint8: img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if img is None or img.size == 0:
+            raise ValueError("Input image is empty or None.")
+        if img.dtype != np.uint8:
+            img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         if img.ndim == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif img.shape[-1] == 4:
@@ -154,46 +148,35 @@ class PerspectiveCorrection(Component):
 
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
-        if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
+        if img_obj is None or img_obj.value is None:
+            raise ValueError("No input image provided or failed to load.")
 
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
 
-        document_quad = None
+        # Tek ve güçlü fonksiyon ile belge köşelerini bul
+        document_quad = find_document_contour(src_img)
 
-        # --- ACİL SERVİS MODELİ (GÜÇLENDİRİLMİŞ UZMANLA) DEVREDE ---
-
-        print("Aşama 1 (Hızlı Gözcü) deneniyor...")
-        document_quad = stage1_fast_and_simple(src_img)
-
+        # Eğer bir kontur bulunamazsa, fallback olarak tüm görüntüyü kullan
         if document_quad is None:
-            print("Aşama 1 başarısız. Aşama 2 (Sınır Gözcüsü) deneniyor...")
-            document_quad = stage2_boundary_watcher(src_img)
+            print("Belge konturu bulunamadı. Fallback olarak tüm görüntü kullanılıyor.")
+            document_quad = np.array([
+                [0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]
+            ], dtype=np.float32)
 
-        if document_quad is None:
-            print("Aşama 2 başarısız. Aşama 3 (Renk Avcısı) deneniyor...")
-            document_quad = stage3_color_clustering(src_img)
-
-        if document_quad is not None:
-            print("Başarılı: Uygun bir belge adayı bulundu.")
-        else:
-            print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
-            document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-
+        # Perspektifi düzelt
         warped = _four_point_transform(src_img, document_quad)
-        if warped is None:
-            print("Dönüşüm hatası, fallback kullanılıyor.")
-            warped = src_img
-            document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
+
         self.context["src_quad"] = document_quad.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
+
         return build_response(context=self)
 
 
 # -----------------------------------------------------------------------------
-# Çalıştırıcı
+# 4. Çalıştırıcı
 # -----------------------------------------------------------------------------
 Executor(sys.argv[1]).run()

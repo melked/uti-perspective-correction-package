@@ -39,7 +39,7 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightB = np.linalg.norm(tl - bl)
     maxWidth = max(int(widthA), int(widthB));
     maxHeight = max(int(heightA), int(heightB))
-    if maxWidth == 0 or maxHeight == 0: return None  # Sıfır boyutlu çıktıyı engelle
+    if maxWidth == 0 or maxHeight == 0: return None
     dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
@@ -58,7 +58,7 @@ def _line_intersection(line1, line2):
 
 
 # -----------------------------------------------------------------------------
-# AŞAMA 1: Hızlı Gözcü (Basit Kontur)
+# Stratejiler (Aşama 1, 2, 3, 4)
 # -----------------------------------------------------------------------------
 def stage1_simple_contour(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -76,9 +76,6 @@ def stage1_simple_contour(image: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-# -----------------------------------------------------------------------------
-# AŞAMA 2: Akıllı Yargıç (Puanlamalı Kontur)
-# -----------------------------------------------------------------------------
 def stage2_scored_contour(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
@@ -120,9 +117,6 @@ def stage2_scored_contour(image: np.ndarray) -> Optional[np.ndarray]:
     return best_quad
 
 
-# -----------------------------------------------------------------------------
-# AŞAMA 3: Doku Avcısı (Gabor Filtreleri)
-# -----------------------------------------------------------------------------
 def stage3_texture_analysis(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gabor_kernels = [cv2.getGaborKernel(ksize=(31, 31), sigma=s, theta=t, lambd=10.0, gamma=0.5)
@@ -144,9 +138,6 @@ def stage3_texture_analysis(image: np.ndarray) -> Optional[np.ndarray]:
     return box.astype(np.float32)
 
 
-# -----------------------------------------------------------------------------
-# AŞAMA 4: Çizgi Dedektifi (Gruplamalı Hough)
-# -----------------------------------------------------------------------------
 def stage4_hough_clustered(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
@@ -180,13 +171,14 @@ def stage4_hough_clustered(image: np.ndarray) -> Optional[np.ndarray]:
 
 
 # -----------------------------------------------------------------------------
-# 3. Ana Bileşen (Nihai "Uzmanlar Komitesi" ile)
+# 3. Ana Bileşen
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
-        self.context, self.request.model, self.image = {}, PackageModel(**(self.request.data)), self.request.get_param(
-            "inputImage")
+        self.context = {}
+        self.request.model = PackageModel(**(self.request.data))
+        self.image = self.request.get_param("inputImage")
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
@@ -227,14 +219,16 @@ class PerspectiveCorrection(Component):
             print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
-        warped = self._four_point_transform(src_img, document_quad)
-        if warped is None:  # Eğer transformasyon sonucu boş bir görüntü oluşursa
+        # <<< HATA DÜZELTİLDİ 1: 'self' kaldırıldı, çünkü bu global bir yardımcı fonksiyon.
+        warped = _four_point_transform(src_img, document_quad)
+        if warped is None:
             print("Dönüşüm hatası, fallback kullanılıyor.")
-            warped = src_img  # Orijinal görüntüyü geri ver
+            warped = src_img
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
         img_obj.value = warped
-        self.image = Image.set_frame(img=obj.value, package_uID=self.uID, redis_db=self.redis_db)
+        # <<< HATA DÜZELTİLDİ 2: 'obj' tanımsızdı, 'img_obj' olarak düzeltildi.
+        self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
         self.context["src_quad"] = document_quad.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
         return build_response(context=self)

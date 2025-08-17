@@ -2,10 +2,8 @@ import os
 import sys
 import cv2
 import numpy as np
-import math
-from collections import defaultdict
 
-from typing import Optional, Tuple, List
+from typing import Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -15,6 +13,10 @@ from sdks.novavision.src.helper.executor import Executor
 from components.PerspectiveTransformation.src.utils.response import build_response
 from components.PerspectiveTransformation.src.models.PackageModel import PackageModel
 
+
+# -----------------------------------------------------------------------------
+# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Yok)
+# -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype=np.float32)
@@ -41,130 +43,71 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _line_intersection(line1, line2):
-    rho1, theta1 = line1;
-    rho2, theta2 = line2
-    A = np.array([[np.cos(theta1), np.sin(theta1)], [np.cos(theta2), np.sin(theta2)]])
-    b = np.array([[rho1], [rho2]])
-    try:
-        x0, y0 = np.linalg.solve(A, b)
-        return [int(round(x0)), int(round(y0))]
-    except np.linalg.LinAlgError:
+# -----------------------------------------------------------------------------
+# SON ÇARE: Doku Analizi ile Belge Tespiti (Gabor Filtreleri)
+# -----------------------------------------------------------------------------
+def find_document_by_texture(image: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Geometri yerine doku analizi kullanarak belgeyi bulmaya çalışır.
+    Yoğun dokulu (yazı, çizgi) alanları tespit eder.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Adım 1: Gabor Filtre Bankası Oluştur
+    # Farklı yönelimlerdeki dokuları yakalamak için bir filtre seti
+    gabor_kernels = []
+    for theta in np.arange(0, np.pi, np.pi / 4):  # 0, 45, 90, 135 derece
+        kernel = cv2.getGaborKernel(
+            ksize=(31, 31),  # Kernel boyutu
+            sigma=4.0,  # Dalganın standart sapması
+            theta=theta,  # Yönelim
+            lambd=10.0,  # Dalgaboyu
+            gamma=0.5,  # En-boy oranı
+            psi=0,
+            ktype=cv2.CV_32F
+        )
+        gabor_kernels.append(kernel)
+
+    # Adım 2: Filtreleri Uygula ve Yanıtları Birleştir
+    # Her filtre, kendi yönelimindeki dokulara güçlü yanıt verir
+    accum = np.zeros_like(gray, dtype=np.float32)
+    for kernel in gabor_kernels:
+        filtered_img = cv2.filter2D(gray, cv2.CV_32F, kernel)
+        np.maximum(accum, filtered_img, accum)
+
+    # Adım 3: Doku Enerji Haritasını Oluştur ve Eşikle
+    accum = cv2.normalize(accum, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, thresh = cv2.threshold(accum, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Adım 4: Morfolojik Temizlik ile Maskeyi Sağlamlaştır
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=5)
+
+    # Adım 5: Temizlenmiş Maskeden Konturları Çıkar
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
         return None
 
+    # En büyük konturu al ve dörtgene yaklaştır
+    c = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.04 * peri, True)  # Epsilon'u biraz artırabiliriz
 
-def stage1_simple_contour(image: np.ndarray) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 75, 200)
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        for c in contours:
-            if cv2.contourArea(c) < (image.shape[0] * image.shape[1] * 0.1): break
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                return approx.reshape(4, 2).astype(np.float32)
-    return None
+    if len(approx) == 4 and cv2.isContourConvex(approx):
+        if cv2.contourArea(approx) > image.shape[0] * image.shape[1] * 0.1:  # Çok küçük değilse
+            return approx.reshape(4, 2).astype(np.float32)
 
-
-def stage2_scored_contour(image: np.ndarray) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-    thresh = cv2.adaptiveThreshold(bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 4)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-    closed = cv2.erode(closed, None, iterations=2);
-    closed = cv2.dilate(closed, None, iterations=2)
-
-    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
-
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-    h, w = image.shape[:2];
-    img_center = np.array([w / 2, h / 2])
-    best_score = -1;
-    best_quad = None
-
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            quad = approx.reshape(4, 2).astype(np.float32)
-            area = cv2.contourArea(quad);
-            area_score = np.clip(area / (w * h), 0, 1)
-            M = cv2.moments(quad);
-            if M["m00"] == 0: continue
-            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
-            dist = np.linalg.norm(np.array([cx, cy]) - img_center)
-            centrality_score = 1 - np.clip(dist / (max(w, h) / 2), 0, 1)
-            rect = _order_points(quad);
-            (tl, tr, br, bl) = rect
-            width = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
-            height = (np.linalg.norm(tl - bl) + np.linalg.norm(tr - br)) / 2
-            if min(width, height) < 1e-6: continue
-            aspect_ratio = max(width, height) / min(width, height)
-            aspect_score = math.exp(-0.5 * ((aspect_ratio - 1.4) ** 2))
-            final_score = (area_score * 0.4) + (centrality_score * 0.4) + (aspect_score * 0.2)
-            if final_score > best_score:
-                best_score, best_quad = final_score, quad
-    return best_quad
-
-def stage3_hough_clustered(image: np.ndarray, min_area_ratio=0.1) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 4))
-    if lines is None: return None
-
-    # Çizgileri grupla
-    clusters = defaultdict(list)
-    for line in lines:
-        rho, theta = line[0]
-        # Açıya ve mesafeye göre benzer çizgileri aynı gruba koy
-        key = (round(theta * 10 / np.pi), round(rho / 50))
-        clusters[key].append((rho, theta))
-
-    # En büyük 4 kümeyi bul (sol, sağ, üst, alt kenarlar)
-    clusters = [v for k, v in clusters.items() if len(v) > 2]  # Sadece güçlü kümeleri al
-    clusters.sort(key=len, reverse=True)
-    if len(clusters) < 4: return None
-
-    # Kümelerin ortalama çizgisini hesapla
-    avg_lines = [np.mean(cluster, axis=0) for cluster in clusters]
-
-    h_lines, v_lines = [], []
-    for line in avg_lines:
-        _, theta = line
-        if theta < np.pi / 4 or theta > 3 * np.pi / 4:
-            v_lines.append(line)
-        else:
-            h_lines.append(line)
-
-    if len(h_lines) < 2 or len(v_lines) < 2: return None
-
-    # En dıştaki ortalama çizgileri bul
-    h_lines.sort(key=lambda x: x[0]);
-    v_lines.sort(key=lambda x: x[0])
-    top, bottom = h_lines[0], h_lines[-1]
-    left, right = v_lines[0], v_lines[-1]
-
-    corners = []
-    corners.append(_line_intersection(top, left))
-    corners.append(_line_intersection(top, right))
-    corners.append(_line_intersection(bottom, right))
-    corners.append(_line_intersection(bottom, left))
-
-    if any(c is None for c in corners): return None
-
-    quad = np.array(corners, dtype=np.float32)
-    if cv2.contourArea(quad) < (image.shape[0] * image.shape[1] * min_area_ratio):
-        return None  # Çok küçükse reddet
-
-    return quad
+    # Eğer 4 köşe bulamazsa, konturun minimum alanlı dörtgenini dene
+    rect = cv2.minAreaRect(c)
+    box = cv2.boxPoints(rect)
+    box = np.int0(box)
+    return box.astype(np.float32)
 
 
+# -----------------------------------------------------------------------------
+# Ana Bileşen (Son Çare Stratejisi ile)
+# -----------------------------------------------------------------------------
 class PerspectiveTransformation(Component):
     # __init__, bootstrap, _prepare_image metodları aynı
     def __init__(self, request, bootstrap):
@@ -193,26 +136,11 @@ class PerspectiveTransformation(Component):
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
 
-        document_quad = None
+        print("Son Çare: Doku Analizi (Gabor) deneniyor...")
+        document_quad = find_document_by_texture(src_img)
 
-        # --- UZMANLAR KOMİTESİ ÇALIŞIYOR ---
-        # 1. Hızlı Gözcü'yü dene
-        print("Aşama 1 (Hızlı Gözcü) deneniyor...")
-        document_quad = stage1_simple_contour(src_img)
-
-        # 2. Akıllı Yargıç'ı dene
         if document_quad is None:
-            print("Aşama 1 başarısız. Aşama 2 (Akıllı Yargıç) deneniyor...")
-            document_quad = stage2_scored_contour(src_img)
-
-        # 3. Çizgi Dedektifi'ni dene
-        if document_quad is None:
-            print("Aşama 2 başarısız. Aşama 3 (Çizgi Dedektifi) deneniyor...")
-            document_quad = stage3_hough_clustered(src_img)
-
-        # Fallback: Komite bile başarısız olursa
-        if document_quad is None:
-            print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
+            print("Tüm klasik yöntemler tükendi. Fallback olarak tüm görüntü kullanılıyor.")
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
         warped = _four_point_transform(src_img, document_quad)
@@ -222,4 +150,8 @@ class PerspectiveTransformation(Component):
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
         return build_response(context=self)
 
+
+# -----------------------------------------------------------------------------
+# Çalıştırıcı
+# -----------------------------------------------------------------------------
 Executor(sys.argv[1]).run()

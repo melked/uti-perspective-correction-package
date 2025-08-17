@@ -16,7 +16,7 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri Yardımcı Fonksiyonları
+# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Yok)
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -58,9 +58,10 @@ def _line_intersection(line1, line2):
 
 
 # -----------------------------------------------------------------------------
-# Stratejiler (Aşama 1, 2, 3, 4)
+# Stratejiler (Aşama 1, 3, 4 Değişiklik Yok, Aşama 2 Güçlendirildi)
 # -----------------------------------------------------------------------------
 def stage1_simple_contour(image: np.ndarray) -> Optional[np.ndarray]:
+    # ... (Bu fonksiyon aynı)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 50, 150)
@@ -76,13 +77,22 @@ def stage1_simple_contour(image: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-def stage2_scored_contour(image: np.ndarray) -> Optional[np.ndarray]:
+def stage2_scored_contour(image: np.ndarray) -> Optional[np.ndarray]:  # <<< BU FONKSİYON GÜÇLENDİRİLDİ
+    """
+    Ön işleme adımı, iç detayları birleştirmek için daha agresif hale getirildi.
+    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
-    thresh = cv2.adaptiveThreshold(bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
+    # Gürültüyü azaltırken kenarları koru
+    bilateral = cv2.bilateralFilter(gray, 11, 75, 75)
+    # Adaptif eşikleme
+    thresh = cv2.adaptiveThreshold(bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 7)
 
+    # <<< DEĞİŞİKLİK: Kernel boyutu ve tekrar sayısı artırılarak morfolojik kapatma güçlendirildi.
+    # Bu, yazı gibi iç detayları belgenin geneliyle birleştirmeye yardımcı olur.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 10))  # Yatay birleştirmeye öncelik ver
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=5)
+
+    # Puanlama kısmı aynı kalıyor, çünkü mantığı doğru. Sadece girdisini iyileştirdik.
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
 
@@ -118,6 +128,7 @@ def stage2_scored_contour(image: np.ndarray) -> Optional[np.ndarray]:
 
 
 def stage3_texture_analysis(image: np.ndarray) -> Optional[np.ndarray]:
+    # ... (Bu fonksiyon aynı)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gabor_kernels = [cv2.getGaborKernel(ksize=(31, 31), sigma=s, theta=t, lambd=10.0, gamma=0.5)
                      for s in (4.0, 6.0) for t in np.arange(0, np.pi, np.pi / 4)]
@@ -139,6 +150,7 @@ def stage3_texture_analysis(image: np.ndarray) -> Optional[np.ndarray]:
 
 
 def stage4_hough_clustered(image: np.ndarray) -> Optional[np.ndarray]:
+    # ... (Bu fonksiyon aynı)
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
     lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 5))
@@ -171,9 +183,10 @@ def stage4_hough_clustered(image: np.ndarray) -> Optional[np.ndarray]:
 
 
 # -----------------------------------------------------------------------------
-# 3. Ana Bileşen
+# 3. Ana Bileşen (Değişiklik Yok)
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
+    # ... (İçi tamamen aynı)
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}
@@ -219,7 +232,6 @@ class PerspectiveCorrection(Component):
             print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
-        # <<< HATA DÜZELTİLDİ 1: 'self' kaldırıldı, çünkü bu global bir yardımcı fonksiyon.
         warped = _four_point_transform(src_img, document_quad)
         if warped is None:
             print("Dönüşüm hatası, fallback kullanılıyor.")
@@ -227,7 +239,6 @@ class PerspectiveCorrection(Component):
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
         img_obj.value = warped
-        # <<< HATA DÜZELTİLDİ 2: 'obj' tanımsızdı, 'img_obj' olarak düzeltildi.
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
         self.context["src_quad"] = document_quad.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]

@@ -15,113 +15,96 @@ from components.PerspectiveTransformation.src.models.PackageModel import Package
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Gerekmiyor)
+# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Yok)
 # -----------------------------------------------------------------------------
-# Bu fonksiyonlar standart ve görev için gerekli. Olduğu gibi kalabilirler.
-
 def _order_points(pts: np.ndarray) -> np.ndarray:
-    """
-    Köşe noktalarını [sol-üst, sağ-üst, sağ-alt, sol-alt] sırasına dizer.
-    """
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype=np.float32)
-
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # Sol-üst köşe en küçük toplama sahiptir
-    rect[2] = pts[np.argmax(s)]  # Sağ-alt köşe en büyük toplama sahiptir
-
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # Sağ-üst köşe en küçük farka sahiptir
-    rect[3] = pts[np.argmax(diff)]  # Sol-alt köşe en büyük farka sahiptir
-
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
     return rect
 
 
 def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    """
-    Verilen 4 köşe noktasına göre görüntünün perspektifini düzeltir.
-    """
     rect = _order_points(pts)
     (tl, tr, br, bl) = rect
-
-    # Çıktı görüntüsünün genişliğini hesapla
     widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
     maxWidth = max(int(widthA), int(widthB))
-
-    # Çıktı görüntüsünün yüksekliğini hesapla
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxHeight = max(int(heightA), int(heightB))
-
-    # Hedef köşe noktalarını belirle (düzleştirilmiş görüntü)
     dst = np.array([
         [0, 0],
         [maxWidth - 1, 0],
         [maxWidth - 1, maxHeight - 1],
         [0, maxHeight - 1]], dtype="float32")
-
-    # Perspektif dönüşüm matrisini hesapla ve uygula
     M = cv2.getPerspectiveTransform(rect, dst)
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
-
     return warped
 
 
 # -----------------------------------------------------------------------------
-# 2. Güçlendirilmiş Tek Adımlı Belge Tespiti
+# 2. SEVİYE 3: Gelişmiş Belge Tespiti (En Zor Durumlar İçin)
 # -----------------------------------------------------------------------------
 
-def find_document_contour(image: np.ndarray) -> Optional[np.ndarray]:
+def _preprocess_for_contours_advanced(image: np.ndarray) -> np.ndarray:
     """
-    Bir görüntüdeki en büyük, dört köşeli belge benzeri nesnenin konturunu bulur.
-
-    Bu fonksiyon, sadeleştirilmiş ve robust bir işlem hattı kullanır:
-    Gri Tonlama -> Gaussian Blur -> Canny Kenar Tespiti -> Kontur Bulma -> Şekil Yaklaşımı
+    Görüntüyü en zorlu senaryolar için hazırlar: düşük kontrast, yansımalar ve gölgeler.
     """
-    # Görüntü alanının %20'sinden küçük konturları göz ardı etmek için bir eşik belirle
-    min_area_ratio = 0.2
-    img_area = image.shape[0] * image.shape[1]
-
-    # Adım 1: Ön İşleme
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Gürültüyü azaltmak ve dokuyu yumuşatmak için Gaussian Blur uygula
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Adım 2: Kenar Tespiti
-    # Canny kenar tespiti, belgenin ana hatlarını ortaya çıkarır
-    edged = cv2.Canny(blurred, 75, 200)
+    # Adım 1: Bilateral Filtre ile yüzeydeki parazitleri (yansıma vb.) azalt ama kenarları koru.
+    bilateral = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    # Adım 3: Kontur Bulma
-    # Kenar haritasındaki tüm kapalı şekilleri (konturları) bul
-    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    # Adım 2: Adaptif Eşikleme ile lokal kontrastı ortaya çıkar. Gölgelerle başa çıkmada çok etkilidir.
+    thresh = cv2.adaptiveThreshold(bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 15, 4)
+
+    # Adım 3: Agresif Morfolojik Kapatma.
+    # Belge üzerindeki metinleri ve kenarlardaki boşlukları birleştirerek tek bir kapalı alan oluşturur.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    # Adım 4: Kalan küçük gürültüleri temizle.
+    closed = cv2.erode(closed, None, iterations=2)
+    closed = cv2.dilate(closed, None, iterations=2)
+
+    return closed
+
+
+def find_document_contour_final(image: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Gelişmiş ön işleme hattını kullanarak en zorlu görüntülerde bile belge konturunu bulur.
+    """
+    preprocessed = _preprocess_for_contours_advanced(image)
+
+    contours, _ = cv2.findContours(preprocessed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
         return None
 
-    # Konturları alana göre büyükten küçüğe sırala
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-    # Adım 4: En Olası Konturu Bul
-    # En büyük konturları gezerek 4 köşeli olanı ara
-    for c in contours:
-        # Alan kontrolü: Çok küçük konturları atla
-        if cv2.contourArea(c) < img_area * min_area_ratio:
-            break
-
+    # En büyük konturun 4 köşesi olup olmadığını kontrol et
+    if len(contours) > 0:
+        c = contours[0]
         peri = cv2.arcLength(c, True)
-        # Konturu daha basit bir çokgene yaklaştır (approximate)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
 
-        # Eğer yaklaştırılan şeklin 4 köşesi varsa, bu bizim belgemizdir
-        if len(approx) == 4:
+        # En büyük kontur bir dörtgen ise onu döndür
+        if len(approx) == 4 and cv2.isContourConvex(approx):
             return approx.reshape(4, 2).astype(np.float32)
 
     return None
 
 
 # -----------------------------------------------------------------------------
-# 3. Ana Bileşen
+# 3. Ana Bileşen (Nihai Fonksiyonu Kullanacak Şekilde)
 # -----------------------------------------------------------------------------
 
 class PerspectiveTransformation(Component):
@@ -154,17 +137,15 @@ class PerspectiveTransformation(Component):
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
 
-        # Tek ve güçlü fonksiyon ile belge köşelerini bul
-        document_quad = find_document_contour(src_img)
+        # En gelişmiş ve sağlam fonksiyonu çağır
+        document_quad = find_document_contour_final(src_img)
 
-        # Eğer bir kontur bulunamazsa, fallback olarak tüm görüntüyü kullan
         if document_quad is None:
             print("Belge konturu bulunamadı. Fallback olarak tüm görüntü kullanılıyor.")
             document_quad = np.array([
                 [0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]
             ], dtype=np.float32)
 
-        # Perspektifi düzelt
         warped = _four_point_transform(src_img, document_quad)
 
         img_obj.value = warped

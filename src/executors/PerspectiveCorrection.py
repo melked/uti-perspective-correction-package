@@ -15,7 +15,7 @@ from components.PerspectiveTransformation.src.models.PackageModel import Package
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Yok)
+# 1. Geometri Yardımcı Fonksiyonları
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -44,72 +44,54 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------------------------------------------------------
-# SON ÇARE: Doku Analizi ile Belge Tespiti (Gabor Filtreleri)
+# Doku Analizi ile Belge Tespiti (Gabor Filtreleri)
 # -----------------------------------------------------------------------------
 def find_document_by_texture(image: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Geometri yerine doku analizi kullanarak belgeyi bulmaya çalışır.
-    Yoğun dokulu (yazı, çizgi) alanları tespit eder.
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Adım 1: Gabor Filtre Bankası Oluştur
-    # Farklı yönelimlerdeki dokuları yakalamak için bir filtre seti
     gabor_kernels = []
-    for theta in np.arange(0, np.pi, np.pi / 4):  # 0, 45, 90, 135 derece
+    for theta in np.arange(0, np.pi, np.pi / 4):
         kernel = cv2.getGaborKernel(
-            ksize=(31, 31),  # Kernel boyutu
-            sigma=4.0,  # Dalganın standart sapması
-            theta=theta,  # Yönelim
-            lambd=10.0,  # Dalgaboyu
-            gamma=0.5,  # En-boy oranı
-            psi=0,
-            ktype=cv2.CV_32F
+            ksize=(31, 31), sigma=4.0, theta=theta, lambd=10.0,
+            gamma=0.5, psi=0, ktype=cv2.CV_32F
         )
         gabor_kernels.append(kernel)
 
-    # Adım 2: Filtreleri Uygula ve Yanıtları Birleştir
-    # Her filtre, kendi yönelimindeki dokulara güçlü yanıt verir
     accum = np.zeros_like(gray, dtype=np.float32)
     for kernel in gabor_kernels:
         filtered_img = cv2.filter2D(gray, cv2.CV_32F, kernel)
         np.maximum(accum, filtered_img, accum)
 
-    # Adım 3: Doku Enerji Haritasını Oluştur ve Eşikle
     accum = cv2.normalize(accum, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     _, thresh = cv2.threshold(accum, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Adım 4: Morfolojik Temizlik ile Maskeyi Sağlamlaştır
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=5)
 
-    # Adım 5: Temizlenmiş Maskeden Konturları Çıkar
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if not contours:
         return None
 
-    # En büyük konturu al ve dörtgene yaklaştır
     c = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(c) < image.shape[0] * image.shape[1] * 0.1:
+        return None
+
     peri = cv2.arcLength(c, True)
-    approx = cv2.approxPolyDP(c, 0.04 * peri, True)  # Epsilon'u biraz artırabiliriz
-
+    approx = cv2.approxPolyDP(c, 0.04 * peri, True)
     if len(approx) == 4 and cv2.isContourConvex(approx):
-        if cv2.contourArea(approx) > image.shape[0] * image.shape[1] * 0.1:  # Çok küçük değilse
-            return approx.reshape(4, 2).astype(np.float32)
+        return approx.reshape(4, 2).astype(np.float32)
 
-    # Eğer 4 köşe bulamazsa, konturun minimum alanlı dörtgenini dene
     rect = cv2.minAreaRect(c)
     box = cv2.boxPoints(rect)
-    box = np.int0(box)
     return box.astype(np.float32)
 
 
 # -----------------------------------------------------------------------------
-# Ana Bileşen (Son Çare Stratejisi ile)
+# Ana Bileşen (Adı "PerspectiveCorrection" olarak güncellendi)
 # -----------------------------------------------------------------------------
-class PerspectiveTransformation(Component):
-    # __init__, bootstrap, _prepare_image metodları aynı
+class PerspectiveCorrection(
+    Component):  # <<< DEĞİŞİKLİK: Sınıfın adı isteğiniz üzerine "PerspectiveCorrection" olarak güncellendi.
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
         self.context = {}
@@ -136,7 +118,7 @@ class PerspectiveTransformation(Component):
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
 
-        print("Son Çare: Doku Analizi (Gabor) deneniyor...")
+        print("Doku Analizi (Gabor) deneniyor...")
         document_quad = find_document_by_texture(src_img)
 
         if document_quad is None:

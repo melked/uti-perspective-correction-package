@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import numpy as np
+import math
 from typing import Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
@@ -44,67 +45,85 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------------------------------------------------------
-# NİHAİ STRATEJİ: Renk Kümeleme ile Belge Tespiti (K-Means)
+# UZMAN STRATEJİLERİ
 # -----------------------------------------------------------------------------
-def find_document_by_color_clustering(image: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Görüntüyü baskın renklere ayırır ve en büyük parlak bölgeyi belge olarak kabul eder.
-    """
-    h, w = image.shape[:2]
 
-    # Adım 1: Görüntüyü K-Means için hazırla
-    # Görüntüyü küçülterek işlemi hızlandır
+# UZMAN 1: Hızlı Gözcü (Kolay ve Net Belgeler İçin)
+def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 75, 200)
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) > (image.shape[0] * image.shape[1] * 0.2):
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                return approx.reshape(4, 2).astype(np.float32)
+    return None
+
+
+# UZMAN 2: Akıllı Yargıç (Orta-Zor, Karmaşık Sahneler İçin)
+def stage2_smart_and_scored(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    bilateral = cv2.bilateralFilter(gray, 11, 75, 75)
+    thresh = cv2.adaptiveThreshold(bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 25, 7)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 10))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=5)
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+    h, w = image.shape[:2];
+    img_center = np.array([w / 2, h / 2])
+    best_score = -1;
+    best_quad = None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            quad = approx.reshape(4, 2).astype(np.float32)
+            area = cv2.contourArea(quad);
+            area_score = np.clip(area / (w * h), 0, 1)
+            M = cv2.moments(quad);
+            if M["m00"] == 0: continue
+            cx, cy = int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"])
+            dist = np.linalg.norm(np.array([cx, cy]) - img_center)
+            centrality_score = 1 - np.clip(dist / (max(w, h) / 2), 0, 1)
+            final_score = (area_score * 0.6) + (centrality_score * 0.4)
+            if final_score > best_score:
+                best_score, best_quad = final_score, quad
+    return best_quad
+
+
+# UZMAN 3: Renk Avcısı (En Zor, Kenarsız Sahneler İçin Son Çare)
+def stage3_color_clustering(image: np.ndarray) -> Optional[np.ndarray]:
+    h, w = image.shape[:2]
     scale = 400 / max(h, w)
     small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     pixels = small_img.reshape((-1, 3)).astype(np.float32)
-
-    # Adım 2: K-Means ile renkleri kümele
-    # Görüntüyü 4 ana renge ayır
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
     _, labels, centers = cv2.kmeans(pixels, 4, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
     centers = centers.astype(np.uint8)
-
-    # Adım 3: "Kağıt" kümesini bul
-    # Genellikle en parlak ve en büyük alan kağıttır.
-    # Her kümenin ne kadar parlak olduğunu ve ne kadar büyük olduğunu bulalım.
     lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
-    luminance = [c[0] for c in lab_centers]  # L*a*b* uzayında L parlaklıktır
-
+    luminance = [c[0] for c in lab_centers]
     counts = np.bincount(labels.flatten())
-
-    best_cluster_idx = -1
+    best_cluster_idx = -1;
     max_score = -1
-
-    # En parlak ve en büyük kümeyi bulmak için bir puanlama yapalım
     for i in range(len(centers)):
-        # Çok karanlık kümeleri (yazı, koyu arka plan) ele
         if luminance[i] < 60: continue
-
-        # Puan = Parlaklık * Alan
         score = luminance[i] * counts[i]
         if score > max_score:
-            max_score = score
-            best_cluster_idx = i
-
-    if best_cluster_idx == -1:
-        # Eğer uygun bir parlak küme bulunamazsa, en büyük olanı al
-        best_cluster_idx = np.argmax(counts)
-
-    # Adım 4: Sadece kağıt kümesine ait piksellerden oluşan bir maske oluştur
+            max_score, best_cluster_idx = score, i
+    if best_cluster_idx == -1: best_cluster_idx = np.argmax(counts)
     mask = (labels.reshape(small_img.shape[:2]) == best_cluster_idx).astype(np.uint8) * 255
-
-    # Adım 5: Maskeyi temizle ve tam boyuta geri getir
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
     mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-
-    # Adım 6: Temiz maskeden köşeleri bul
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
-
     c = max(contours, key=cv2.contourArea)
     if cv2.contourArea(c) < w * h * 0.1: return None
-
     rect = cv2.minAreaRect(c)
     box = cv2.boxPoints(rect)
     return box.astype(np.float32)
@@ -140,11 +159,28 @@ class PerspectiveCorrection(Component):
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
 
-        print("Nihai Deneme: Renk Kümeleme (K-Means) deneniyor...")
-        document_quad = find_document_by_color_clustering(src_img)
+        document_quad = None
 
+        # --- ACİL SERVİS MODELİ DEVREDE ---
+
+        # Aşama 1: Triyaj (Hızlı Gözcü)
+        print("Aşama 1 (Hızlı Gözcü) deneniyor...")
+        document_quad = stage1_fast_and_simple(src_img)
+
+        # Aşama 2: Uzman Doktor (Akıllı Yargıç)
         if document_quad is None:
-            print("Tüm klasik yöntemler tükendi. Fallback olarak tüm görüntü kullanılıyor.")
+            print("Aşama 1 başarısız. Aşama 2 (Akıllı Yargıç) deneniyor...")
+            document_quad = stage2_smart_and_scored(src_img)
+
+        # Aşama 3: Konsültan Profesör (Renk Avcısı)
+        if document_quad is None:
+            print("Aşama 2 başarısız. Aşama 3 (Renk Avcısı) deneniyor...")
+            document_quad = stage3_color_clustering(src_img)
+
+        if document_quad is not None:
+            print("Başarılı: Uygun bir belge adayı bulundu.")
+        else:
+            print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
         warped = _four_point_transform(src_img, document_quad)

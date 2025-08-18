@@ -16,7 +16,7 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri Yardımcı Fonksiyonları
+# 1. Geometri Yardımcı Fonksiyonları ve Puanlama
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -39,110 +39,79 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightB = np.linalg.norm(tl - bl)
     maxWidth = max(int(widthA), int(widthB));
     maxHeight = max(int(heightA), int(heightB))
-    if maxWidth <= 10 or maxHeight <= 10: return None  # Çok küçük çıktıları engelle
+    if maxWidth <= 10 or maxHeight <= 10: return None
     dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _score_candidate(quad: np.ndarray, image_shape: tuple) -> float:
-    """ Aday bir dörtgeni puanlayan merkezi bir fonksiyon. """
-    h, w = image_shape[:2]
-    area = cv2.contourArea(quad)
-
-    # GÜVENLİK FİLTRESİ 1: Alan kontrolü
-    total_area = w * h
-    if not (0.05 < area / total_area < 0.95):
-        return 0.0  # Çok küçük veya çok büyük adayları doğrudan ele
-
-    # Puanlama Kriterleri
-    area_score = area / total_area
-
-    M = cv2.moments(quad)
-    if M["m00"] == 0: return 0.0
-    cx = M["m10"] / M["m00"];
-    cy = M["m01"] / M["m00"]
-    centrality_score = 1.0 - (np.linalg.norm(np.array([cx, cy]) - np.array([w / 2, h / 2])) / (max(w, h) / 2))
-
-    rect = _order_points(quad)
-    (tl, tr, br, bl) = rect
-    width = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
-    height = (np.linalg.norm(tl - bl) + np.linalg.norm(tr - br)) / 2
-    if min(width, height) < 1: return 0.0
-    aspect_ratio = max(width, height) / min(width, height)
-    aspect_score = math.exp(-0.5 * ((aspect_ratio - 1.4) ** 2))  # A4 (1.41) oranını ödüllendir
-
-    return (area_score * 0.5) + (centrality_score * 0.3) + (aspect_score * 0.2)
+def _line_intersection(line1, line2):
+    rho1, theta1 = line1;
+    rho2, theta2 = line2
+    A = np.array([[np.cos(theta1), np.sin(theta1)], [np.cos(theta2), np.sin(theta2)]])
+    b = np.array([[rho1], [rho2]])
+    try:
+        x0, y0 = np.linalg.solve(A, b)
+        return [int(round(x0)), int(round(y0))]
+    except np.linalg.LinAlgError:
+        return None
 
 
 # -----------------------------------------------------------------------------
-# UZMAN STRATEJİLERİ (İyileştirilmiş)
+# UZMAN STRATEJİLERİ
 # -----------------------------------------------------------------------------
 
+# UZMAN 1: Hızlı Gözcü (Kolay ve Net Belgeler İçin)
 def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(blurred, 50, 150)
     contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_quad, best_score = None, 0.0
     if contours:
-        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) > (image.shape[0] * image.shape[1] * 0.2):
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
-                quad = approx.reshape(4, 2).astype(np.float32)
-                score = _score_candidate(quad, image.shape)
-                if score > best_score:
-                    best_score, best_quad = score, quad
-    return best_quad if best_score > 0.2 else None  # Minimum puan eşiği
+                return approx.reshape(4, 2).astype(np.float32)
+    return None
 
 
+# UZMAN 2: Sınır Gözcüsü (Gölge ve Işık Savaşçısı)
 def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kernel_size = int(min(image.shape[:2]) / 4)  # Daha güçlü bir etki için kernel büyütüldü
+    kernel_size = int(min(image.shape[:2]) / 5)
     if kernel_size % 2 == 0: kernel_size += 1
     blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
     flattened = cv2.divide(gray, blurred_bg, scale=255)
     _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    best_quad, best_score = None, 0.0
     if contours:
-        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) > (image.shape[0] * image.shape[1] * 0.1):
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
-                quad = approx.reshape(4, 2).astype(np.float32)
-                score = _score_candidate(quad, image.shape)
-                if score > best_score:
-                    best_score, best_quad = score, quad
-    return best_quad if best_score > 0.2 else None
+                return approx.reshape(4, 2).astype(np.float32)
+    return None
 
 
+# UZMAN 3: İçerik Analisti (Renk ve Doku Odaklı)
 def stage3_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
-    h, w = image.shape[:2]
-    scale = 300 / max(h, w)  # Daha hızlı işlem için küçültme oranı ayarlandı
+    h, w = image.shape[:2];
+    total_area = h * w
+    scale = 350 / max(h, w)
     small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     pixels = small_img.reshape((-1, 3)).astype(np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, centers = cv2.kmeans(pixels, 3, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)  # 3 renk kümesi yeterli
+    _, labels, centers = cv2.kmeans(pixels, 3, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
     centers = centers.astype(np.uint8)
     lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
     counts = np.bincount(labels.flatten())
-    best_cluster_idx = -1;
-    max_score = -1
-    # En parlak ve en büyük alanı kaplayan kümeyi bul
     brightest_idx = np.argmax([c[0] for c in lab_centers])
-    largest_idx = np.argmax(counts)
-    # Eğer en parlak ve en büyük aynı değilse ve en parlak olan çok küçük değilse onu seç
-    if brightest_idx != largest_idx and counts[brightest_idx] / pixels.shape[0] > 0.1:
-        best_cluster_idx = brightest_idx
-    else:
-        best_cluster_idx = largest_idx
-
+    best_cluster_idx = brightest_idx
     mask = (labels.reshape(small_img.shape[:2]) == best_cluster_idx).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
@@ -150,15 +119,45 @@ def stage3_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
     c = max(contours, key=cv2.contourArea)
+    box_area = cv2.contourArea(c)
+    if not (0.1 < box_area / total_area < 0.95): return None
     rect = cv2.minAreaRect(c)
     box = cv2.boxPoints(rect)
-    # GÜVENLİK FİLTRESİ 2: Alan kontrolü
-    if not (0.05 < cv2.contourArea(box) / (w * h) < 0.95): return None
     return box.astype(np.float32)
 
 
-# UZMAN 4: Çizgi Dedektifi (Hough) - Bu uzman çok deneysel ve riskli olduğu için şimdilik kaldırıldı.
-# Diğer 3 uzmanın iyileştirilmesiyle çoğu durumun çözülmesi hedeflenmiştir.
+# UZMAN 4: Çizgi Dedektifi (Kopuk Kenarlar İçin)
+def stage4_line_reconstructor(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 4))
+    if lines is None: return None
+    clusters = defaultdict(list)
+    for line in lines:
+        rho, theta = line[0]
+        key = (round(theta * 5 / np.pi), round(rho / 50))
+        clusters[key].append((rho, theta))
+    clusters = [v for k, v in clusters.items() if len(v) > 2]
+    clusters.sort(key=len, reverse=True)
+    if len(clusters) < 4: return None
+    avg_lines = [np.mean(cluster, axis=0) for cluster in clusters[:4]]  # En büyük 4 kümeyi al
+    h_lines, v_lines = [], []
+    for line in avg_lines:
+        _, theta = line
+        if theta < np.pi / 4 or theta > 3 * np.pi / 4:
+            v_lines.append(line)
+        else:
+            h_lines.append(line)
+    if len(h_lines) < 2 or len(v_lines) < 2: return None
+    h_lines.sort(key=lambda x: x[0]);
+    v_lines.sort(key=lambda x: x[0])
+    corners = [_line_intersection(h_lines[0], v_lines[0]), _line_intersection(h_lines[0], v_lines[-1]),
+               _line_intersection(h_lines[-1], v_lines[-1]), _line_intersection(h_lines[-1], v_lines[0])]
+    if any(c is None for c in corners): return None
+    quad = np.array(corners, dtype=np.float32)
+    if cv2.contourArea(quad) < image.shape[0] * image.shape[1] * 0.1: return None
+    return quad
+
 
 # -----------------------------------------------------------------------------
 # Ana Bileşen
@@ -193,7 +192,8 @@ class PerspectiveCorrection(Component):
         strategies = {
             "Hızlı Gözcü": stage1_fast_and_simple,
             "Sınır Gözcüsü": stage2_boundary_watcher,
-            "İçerik Analisti": stage3_content_analyzer
+            "İçerik Analisti": stage3_content_analyzer,
+            "Çizgi Dedektifi": stage4_line_reconstructor,
         }
 
         for name, strategy in strategies.items():

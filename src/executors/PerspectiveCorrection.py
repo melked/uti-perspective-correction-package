@@ -15,9 +15,6 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
-# -----------------------------------------------------------------------------
-# 1. Geometri Yardımcı Fonksiyonları ve Puanlama
-# -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype=np.float32)
@@ -39,7 +36,7 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     heightB = np.linalg.norm(tl - bl)
     maxWidth = max(int(widthA), int(widthB));
     maxHeight = max(int(heightA), int(heightB))
-    if maxWidth <= 10 or maxHeight <= 10: return None
+    if maxWidth <= 0 or maxHeight <= 0: return None
     dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
@@ -57,9 +54,6 @@ def _line_intersection(line1, line2):
         return None
 
 
-# -----------------------------------------------------------------------------
-# UZMAN STRATEJİLERİ
-# -----------------------------------------------------------------------------
 
 # UZMAN 1: Hızlı Gözcü (Kolay ve Net Belgeler İçin)
 def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
@@ -77,7 +71,7 @@ def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-# UZMAN 2: Sınır Gözcüsü (Gölge ve Işık Savaşçısı)
+# UZMAN 2: Sınır Gözcüsü (İçeriği Görmezden Gel, Sınırlara Odaklan)
 def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     kernel_size = int(min(image.shape[:2]) / 5)
@@ -98,20 +92,25 @@ def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-# UZMAN 3: İçerik Analisti (Renk ve Doku Odaklı)
+# UZMAN 3: İçerik Analisti (Sınırlar Belirsizse Renk ve Dokuya Odaklan)
 def stage3_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
-    h, w = image.shape[:2];
-    total_area = h * w
-    scale = 350 / max(h, w)
+    h, w = image.shape[:2]
+    scale = 400 / max(h, w)
     small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     pixels = small_img.reshape((-1, 3)).astype(np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, centers = cv2.kmeans(pixels, 3, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    _, labels, centers = cv2.kmeans(pixels, 4, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
     centers = centers.astype(np.uint8)
     lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
+    luminance = [c[0] for c in lab_centers];
     counts = np.bincount(labels.flatten())
-    brightest_idx = np.argmax([c[0] for c in lab_centers])
-    best_cluster_idx = brightest_idx
+    best_cluster_idx = -1;
+    max_score = -1
+    for i in range(len(centers)):
+        if luminance[i] < 60: continue
+        score = luminance[i] * counts[i]
+        if score > max_score: max_score, best_cluster_idx = score, i
+    if best_cluster_idx == -1: best_cluster_idx = np.argmax(counts)
     mask = (labels.reshape(small_img.shape[:2]) == best_cluster_idx).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
@@ -119,28 +118,27 @@ def stage3_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
     c = max(contours, key=cv2.contourArea)
-    box_area = cv2.contourArea(c)
-    if not (0.1 < box_area / total_area < 0.95): return None
+    if cv2.contourArea(c) < w * h * 0.1: return None
     rect = cv2.minAreaRect(c)
     box = cv2.boxPoints(rect)
     return box.astype(np.float32)
 
 
 # UZMAN 4: Çizgi Dedektifi (Kopuk Kenarlar İçin)
-def stage4_line_reconstructor(image: np.ndarray) -> Optional[np.ndarray]:
+def stage4_hough_clustered(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 4))
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 5))
     if lines is None: return None
     clusters = defaultdict(list)
     for line in lines:
         rho, theta = line[0]
-        key = (round(theta * 5 / np.pi), round(rho / 50))
+        key = (round(theta * 10 / np.pi), round(rho / 60))
         clusters[key].append((rho, theta))
-    clusters = [v for k, v in clusters.items() if len(v) > 2]
+    clusters = [v for k, v in clusters.items() if len(v) > 3]
     clusters.sort(key=len, reverse=True)
     if len(clusters) < 4: return None
-    avg_lines = [np.mean(cluster, axis=0) for cluster in clusters[:4]]  # En büyük 4 kümeyi al
+    avg_lines = [np.mean(cluster, axis=0) for cluster in clusters]
     h_lines, v_lines = [], []
     for line in avg_lines:
         _, theta = line
@@ -158,10 +156,6 @@ def stage4_line_reconstructor(image: np.ndarray) -> Optional[np.ndarray]:
     if cv2.contourArea(quad) < image.shape[0] * image.shape[1] * 0.1: return None
     return quad
 
-
-# -----------------------------------------------------------------------------
-# Ana Bileşen
-# -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
@@ -185,6 +179,7 @@ class PerspectiveCorrection(Component):
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
+
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
 
@@ -193,7 +188,7 @@ class PerspectiveCorrection(Component):
             "Hızlı Gözcü": stage1_fast_and_simple,
             "Sınır Gözcüsü": stage2_boundary_watcher,
             "İçerik Analisti": stage3_content_analyzer,
-            "Çizgi Dedektifi": stage4_line_reconstructor,
+            "Çizgi Dedektifi": stage4_hough_clustered
         }
 
         for name, strategy in strategies.items():
@@ -220,7 +215,4 @@ class PerspectiveCorrection(Component):
         return build_response(context=self)
 
 
-# -----------------------------------------------------------------------------
-# Çalıştırıcı
-# -----------------------------------------------------------------------------
 Executor(sys.argv[1]).run()

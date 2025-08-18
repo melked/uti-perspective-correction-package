@@ -8,6 +8,7 @@ from typing import Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
+# ... Diğer importlar ve Component/Executor sınıfları aynı ...
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
@@ -15,6 +16,9 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
+# -----------------------------------------------------------------------------
+# 1. Geometri Yardımcı Fonksiyonları (Değişiklik Yok)
+# -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype=np.float32)
@@ -54,8 +58,11 @@ def _line_intersection(line1, line2):
         return None
 
 
+# -----------------------------------------------------------------------------
+# UZMAN STRATEJİLERİ
+# -----------------------------------------------------------------------------
 
-# UZMAN 1: Hızlı Gözcü (Kolay ve Net Belgeler İçin)
+# UZMAN 1 ve 2 (Değişiklik Yok)
 def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -71,7 +78,6 @@ def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-# UZMAN 2: Sınır Gözcüsü (İçeriği Görmezden Gel, Sınırlara Odaklan)
 def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     kernel_size = int(min(image.shape[:2]) / 5)
@@ -92,9 +98,10 @@ def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     return None
 
 
-# UZMAN 3: İçerik Analisti (Sınırlar Belirsizse Renk ve Dokuya Odaklan)
+# UZMAN 3: İçerik Analisti (GÜVENLİK FİLTRESİ EKLENDİ)
 def stage3_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
     h, w = image.shape[:2]
+    total_area = h * w
     scale = 400 / max(h, w)
     small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     pixels = small_img.reshape((-1, 3)).astype(np.float32)
@@ -118,13 +125,23 @@ def stage3_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
     c = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(c) < w * h * 0.1: return None
+    if cv2.contourArea(c) < total_area * 0.1: return None
+
     rect = cv2.minAreaRect(c)
     box = cv2.boxPoints(rect)
+
+    # <<< DEĞİŞİKLİK: Akıllı Güvenlik Filtresi
+    # Eğer bulunan kutunun alanı, toplam alanın %95'inden büyükse, bu bir hatadır.
+    # Algoritma tüm sahneyi buldu demektir, bu yüzden sonucu reddediyoruz.
+    box_area = cv2.contourArea(box)
+    if box_area > total_area * 0.95:
+        print("Stage 3 uyarısı: Bulunan alan çok büyük, muhtemelen hatalı. Reddediliyor.")
+        return None
+
     return box.astype(np.float32)
 
 
-# UZMAN 4: Çizgi Dedektifi (Kopuk Kenarlar İçin)
+# UZMAN 4 (Değişiklik Yok)
 def stage4_hough_clustered(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
@@ -156,6 +173,10 @@ def stage4_hough_clustered(image: np.ndarray) -> Optional[np.ndarray]:
     if cv2.contourArea(quad) < image.shape[0] * image.shape[1] * 0.1: return None
     return quad
 
+
+# -----------------------------------------------------------------------------
+# Ana Bileşen (Değişiklik Yok)
+# -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
@@ -179,10 +200,8 @@ class PerspectiveCorrection(Component):
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
-
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
-
         document_quad = None
         strategies = {
             "Hızlı Gözcü": stage1_fast_and_simple,
@@ -190,24 +209,20 @@ class PerspectiveCorrection(Component):
             "İçerik Analisti": stage3_content_analyzer,
             "Çizgi Dedektifi": stage4_hough_clustered
         }
-
         for name, strategy in strategies.items():
             print(f"Aşama ( {name} ) deneniyor...")
             document_quad = strategy(src_img)
             if document_quad is not None:
                 print(f"Başarılı: Belge '{name}' stratejisi ile bulundu.")
                 break
-
         if document_quad is None:
             print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-
         warped = _four_point_transform(src_img, document_quad)
         if warped is None:
             print("Dönüşüm hatası, fallback kullanılıyor.")
             warped = src_img
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
         self.context["src_quad"] = document_quad.tolist()
@@ -215,4 +230,7 @@ class PerspectiveCorrection(Component):
         return build_response(context=self)
 
 
+# -----------------------------------------------------------------------------
+# Çalıştırıcı
+# -----------------------------------------------------------------------------
 Executor(sys.argv[1]).run()

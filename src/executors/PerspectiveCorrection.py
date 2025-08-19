@@ -17,7 +17,7 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri, Puanlama ve Hassas Ayar Fonksiyonları
+# 1. Geometri, Puanlama ve Yardımcı Fonksiyonlar
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -46,18 +46,19 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _refine_corners(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
-    """ Kaba köşe tahminlerini sub-pixel hassasiyetinde rafine eder. """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    winSize = (11, 11)
-    zeroZone = (-1, -1)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    refined_corners = cv2.cornerSubPix(gray, corners.astype(np.float32), winSize, zeroZone, criteria)
-    return refined_corners
+def _line_intersection(line1, line2):
+    rho1, theta1 = line1;
+    rho2, theta2 = line2
+    A = np.array([[np.cos(theta1), np.sin(theta1)], [np.cos(theta2), np.sin(theta2)]])
+    b = np.array([[rho1], [rho2]])
+    try:
+        x0, y0 = np.linalg.solve(A, b)
+        return [int(round(x0)), int(round(y0))]
+    except np.linalg.LinAlgError:
+        return None
 
 
 def _score_candidate(contour: np.ndarray, image_shape: tuple) -> float:
-    # ... (Bu fonksiyon öncekiyle aynı)
     h, w = image_shape[:2];
     total_area = w * h
     area = cv2.contourArea(contour)
@@ -69,7 +70,6 @@ def _score_candidate(contour: np.ndarray, image_shape: tuple) -> float:
 
 
 def find_best_quad_from_contours(contours: list, image_shape: tuple) -> Optional[np.ndarray]:
-    # ... (Bu fonksiyon öncekiyle aynı)
     if not contours: return None
     best_quad, best_score = None, 0.2
     for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
@@ -84,7 +84,7 @@ def find_best_quad_from_contours(contours: list, image_shape: tuple) -> Optional
 
 
 # -----------------------------------------------------------------------------
-# UZMAN STRATEJİLERİ (Değişiklik Yok)
+# UZMAN STRATEJİLERİ
 # -----------------------------------------------------------------------------
 def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -107,10 +107,62 @@ def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     return find_best_quad_from_contours(contours, image.shape)
 
 
-# ... (stage3 ve stage4 de eklenebilir, mantık aynı kalacaktır)
+def stage3_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
+    h, w = image.shape[:2]
+    scale = 300 / max(h, w)
+    small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    pixels = small_img.reshape((-1, 3)).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, centers = cv2.kmeans(pixels, 3, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    centers = centers.astype(np.uint8)
+    lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
+    brightest_idx = np.argmax([c[0] for c in lab_centers])
+    mask = (labels.reshape(small_img.shape[:2]) == brightest_idx).astype(np.uint8) * 255
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(c) / (w * h) < 0.05: return None
+    rect = cv2.minAreaRect(c)
+    box = cv2.boxPoints(rect)
+    return box.astype(np.float32)
+
+
+def stage4_line_reconstructor(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 4))
+    if lines is None: return None
+    clusters = defaultdict(list)
+    for line in lines:
+        rho, theta = line[0]
+        key = (round(theta * 5 / np.pi), round(rho / 50))
+        clusters[key].append((rho, theta))
+    clusters = sorted([v for k, v in clusters.items() if len(v) > 2], key=len, reverse=True)
+    if len(clusters) < 4: return None
+    avg_lines = [np.mean(cluster, axis=0) for cluster in clusters[:4]]
+    h_lines, v_lines = [], []
+    for line in avg_lines:
+        _, theta = line
+        if theta < np.pi / 4 or theta > 3 * np.pi / 4:
+            v_lines.append(line)
+        else:
+            h_lines.append(line)
+    if len(h_lines) < 2 or len(v_lines) < 2: return None
+    h_lines.sort(key=lambda x: x[0]);
+    v_lines.sort(key=lambda x: x[0])
+    corners = [_line_intersection(h_lines[0], v_lines[0]), _line_intersection(h_lines[0], v_lines[-1]),
+               _line_intersection(h_lines[-1], v_lines[-1]), _line_intersection(h_lines[-1], v_lines[0])]
+    if any(c is None for c in corners): return None
+    quad = np.array(corners, dtype=np.float32)
+    if cv2.contourArea(quad) < image.shape[0] * image.shape[1] * 0.1: return None
+    return quad
+
 
 # -----------------------------------------------------------------------------
-# Ana Bileşen (run metodu güncellendi)
+# Ana Bileşen
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -144,6 +196,8 @@ class PerspectiveCorrection(Component):
         strategies = {
             "Hızlı Gözcü": stage1_fast_and_simple,
             "Sınır Gözcüsü": stage2_boundary_watcher,
+            "İçerik Analisti": stage3_content_analyzer,
+            "Çizgi Dedektifi": stage4_line_reconstructor,
         }
 
         for name, strategy in strategies.items():
@@ -151,15 +205,12 @@ class PerspectiveCorrection(Component):
             candidate_quad = strategy(src_img)
 
             if candidate_quad is not None:
-                # <<< YENİ ADIM: "Hassas Ayar" Uzmanı devreye giriyor
-                print(f"'{name}' ile kaba aday bulundu. Köşeler hassaslaştırılıyor...")
-                refined_quad = _refine_corners(src_img, candidate_quad)
-
-                warped_candidate = _four_point_transform(src_img, refined_quad)
+                # 'Hassas Ayar' adımı kaldırıldı. Direkt adayın sonucunu kullanıyoruz.
+                warped_candidate = _four_point_transform(src_img, candidate_quad)
 
                 if warped_candidate is not None:
                     print(f"Başarılı: Belge '{name}' stratejisi ile bulundu ve doğrulandı.")
-                    document_quad = refined_quad
+                    document_quad = candidate_quad
                     warped = warped_candidate
                     break
                 else:

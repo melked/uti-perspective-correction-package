@@ -16,7 +16,7 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri, Puanlama ve YENİ Yardımcı Fonksiyonlar
+# 1. Geometri, Puanlama ve Yardımcı Fonksiyonlar
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -45,46 +45,62 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _unsharp_mask(image: np.ndarray, strength: float = 1.5, kernel_size: tuple = (5, 5)) -> np.ndarray:
-    """ Görüntüyü keskinleştirerek bulanıklığı azaltır. """
+def _unsharp_mask(image: np.ndarray, strength: float = 2.0, kernel_size: tuple = (5, 5)) -> np.ndarray:
     if image.ndim == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image
-
     blurred = cv2.GaussianBlur(gray, kernel_size, 0)
     sharpened = cv2.addWeighted(gray, 1.0 + strength, blurred, -strength, 0)
-
-    if image.ndim == 3:
-        return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+    if image.ndim == 3: return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
     return sharpened
+
+
+def _score_candidate(contour: np.ndarray, image_shape: tuple) -> float:
+    h, w = image_shape[:2];
+    total_area = w * h
+    area = cv2.contourArea(contour)
+    if not (0.05 < area / total_area < 0.95): return 0.0
+    peri = cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+    if len(approx) != 4 or not cv2.isContourConvex(approx): return 0.0
+    M = cv2.moments(approx);
+    if M["m00"] == 0: return 0.0
+    cx = M["m10"] / M["m00"];
+    cy = M["m01"] / M["m00"]
+    centrality_score = 1.0 - (np.linalg.norm(np.array([cx, cy]) - np.array([w / 2, h / 2])) / (max(w, h) / 2))
+    return (area / total_area) * 0.7 + centrality_score * 0.3
 
 
 def find_best_quad_from_contours(contours: list, image_shape: tuple) -> Optional[np.ndarray]:
     if not contours: return None
-    best_quad, best_score = None, 0.1  # Daha esnek bir başlangıç skoru
+    best_quad, best_score = None, 0.25
     for c in sorted(contours, key=cv2.contourArea, reverse=True)[:7]:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            area = cv2.contourArea(approx)
-            total_area = image_shape[0] * image_shape[1]
-            if not (0.05 < area / total_area < 0.95): continue
-
-            score = area / total_area  # Basit alan puanlaması
-            if score > best_score:
-                best_score = score
-                best_quad = approx
+        score = _score_candidate(c, image_shape)
+        if score > best_score:
+            best_score = score
+            peri = cv2.arcLength(c, True)
+            best_quad = cv2.approxPolyDP(c, 0.02 * peri, True)
     return best_quad.reshape(4, 2).astype(np.float32) if best_quad is not None else None
 
 
-# -----------------------------------------------------------------------------
-# UZMAN STRATEJİLERİ (Bulanıklığa Karşı Güçlendirildi)
-# -----------------------------------------------------------------------------
+def _line_intersection(line1, line2):
+    rho1, theta1 = line1;
+    rho2, theta2 = line2
+    A = np.array([[np.cos(theta1), np.sin(theta1)], [np.cos(theta2), np.sin(theta2)]])
+    b = np.array([[rho1], [rho2]])
+    try:
+        x0, y0 = np.linalg.solve(A, b)
+        return [int(round(x0)), int(round(y0))]
+    except np.linalg.LinAlgError:
+        return None
 
+
+# -----------------------------------------------------------------------------
+# UZMAN STRATEJİLERİ
+# -----------------------------------------------------------------------------
 def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Bulanık görüntüler için Canny eşikleri daha gevşek ayarlandı
     edged = cv2.Canny(gray, 30, 100)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     edged = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -94,18 +110,50 @@ def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
 
 def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kernel_size = int(min(image.shape[:2]) / 4)  # Daha agresif arka plan tahmini
+    kernel_size = int(min(image.shape[:2]) / 4)
     if kernel_size % 2 == 0: kernel_size += 1
     blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
     flattened = cv2.divide(gray, blurred_bg, scale=255)
     _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # Bulanık kenarları toparlamak için daha güçlü morfolojik operasyonlar
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=4)
-
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=5)
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     return find_best_quad_from_contours(contours, image.shape)
+
+
+def stage3_line_reconstructor(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 4))
+    if lines is None: return None
+    h_lines, v_lines = [], []
+    for line in lines:
+        rho, theta = line[0]
+        if theta < np.pi / 4 or theta > 3 * np.pi / 4:
+            v_lines.append((rho, theta))
+        else:
+            h_lines.append((rho, theta))
+    if len(h_lines) < 2 or len(v_lines) < 2: return None
+
+    # En dıştaki çizgileri bul (laptop gibi gürültüleri elemek için daha sağlam mantık)
+    h_lines.sort(key=lambda x: x[0]);
+    v_lines.sort(key=lambda x: x[0])
+    top_line = h_lines[0];
+    bottom_line = h_lines[-1]
+    left_line = v_lines[0];
+    right_line = v_lines[-1]
+
+    # Kesişim noktalarını bul
+    p1 = _line_intersection(top_line, left_line)
+    p2 = _line_intersection(top_line, right_line)
+    p3 = _line_intersection(bottom_line, right_line)
+    p4 = _line_intersection(bottom_line, left_line)
+
+    corners = [p for p in [p1, p2, p3, p4] if p is not None]
+    if len(corners) == 4:
+        quad = np.array(corners, dtype=np.float32)
+        return quad
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -136,9 +184,8 @@ class PerspectiveCorrection(Component):
         if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
         src_img_orig = self._prepare_image(img_obj.value)
 
-        # <<< YENİ ADIM: Görüntüyü bulanıklığa karşı en başta keskinleştiriyoruz.
         print("Görüntü bulanıklığa karşı keskinleştiriliyor...")
-        src_img = _unsharp_mask(src_img_orig, strength=2.0)  # Keskinlik gücü artırıldı
+        src_img = _unsharp_mask(src_img_orig)
 
         h, w = src_img.shape[:2]
         document_quad = None
@@ -147,6 +194,7 @@ class PerspectiveCorrection(Component):
         strategies = {
             "Hızlı Gözcü": stage1_fast_and_simple,
             "Sınır Gözcüsü": stage2_boundary_watcher,
+            "Çizgi Dedektifi": stage3_line_reconstructor,
         }
 
         for name, strategy in strategies.items():
@@ -154,9 +202,7 @@ class PerspectiveCorrection(Component):
             candidate_quad = strategy(src_img)
 
             if candidate_quad is not None:
-                # ÖNEMLİ: Dönüşümü orijinal, bozulmamış görüntüde yapıyoruz.
                 warped_candidate = _four_point_transform(src_img_orig, candidate_quad)
-
                 if warped_candidate is not None:
                     print(f"Başarılı: Belge '{name}' stratejisi ile bulundu.")
                     document_quad = candidate_quad
@@ -169,13 +215,6 @@ class PerspectiveCorrection(Component):
             print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             warped = src_img_orig
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-
-        # Son çıktıya ek bir parlaklık/kontrast ayarı yapalım
-        if np.mean(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)) < 100:
-            # Düşük ışıklıysa gama düzeltmesi uygula
-            invGamma = 1.0 / 1.2
-            table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-            warped = cv2.LUT(warped, table)
 
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)

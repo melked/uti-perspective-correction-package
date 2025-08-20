@@ -91,7 +91,8 @@ def _line_intersection(line1, line2):
     b = np.array([[rho1], [rho2]])
     try:
         x0, y0 = np.linalg.solve(A, b)
-        return [int(round(x0)), int(round(y0))]
+        # <<< HATA DÜZELTİLDİ: Sayısal değeri dizi içerisinden [0] ile alıyoruz.
+        return [int(round(x0[0])), int(round(y0[0]))]
     except np.linalg.LinAlgError:
         return None
 
@@ -134,21 +135,16 @@ def stage3_line_reconstructor(image: np.ndarray) -> Optional[np.ndarray]:
         else:
             h_lines.append((rho, theta))
     if len(h_lines) < 2 or len(v_lines) < 2: return None
-
-    # En dıştaki çizgileri bul (laptop gibi gürültüleri elemek için daha sağlam mantık)
     h_lines.sort(key=lambda x: x[0]);
     v_lines.sort(key=lambda x: x[0])
     top_line = h_lines[0];
     bottom_line = h_lines[-1]
     left_line = v_lines[0];
     right_line = v_lines[-1]
-
-    # Kesişim noktalarını bul
     p1 = _line_intersection(top_line, left_line)
     p2 = _line_intersection(top_line, right_line)
     p3 = _line_intersection(bottom_line, right_line)
     p4 = _line_intersection(bottom_line, left_line)
-
     corners = [p for p in [p1, p2, p3, p4] if p is not None]
     if len(corners) == 4:
         quad = np.array(corners, dtype=np.float32)

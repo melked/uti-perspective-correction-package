@@ -23,12 +23,15 @@ class Params:
 
     def __init__(self, config=None):
         config = config or {}
+        # Genel
         self.resize_longest_edge = config.get("resize_longest_edge", 1000)
         self.unsharp_strength = config.get("unsharp_strength", 1.7)
         self.score_min_area_ratio = config.get("score_min_area_ratio", 0.04)
         self.score_max_area_ratio = config.get("score_max_area_ratio", 0.95)
         self.min_score_threshold = config.get("min_score_threshold", 0.25)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
+
+        # Uzmanlar
         self.canny_min = config.get("canny_min", 50)
         self.canny_max = config.get("canny_max", 150)
         self.s2_blur_ratio = config.get("s2_blur_ratio", 5)
@@ -117,7 +120,7 @@ def stage1_fast_and_simple(image: np.ndarray, params: Params) -> Optional[np.nda
 
 def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kernel_size = int(min(image.shape[:2]) / params.s2_blur_ratio);
+    kernel_size = int(min(image.shape[:2]) / params.s2_blur_ratio)
     if kernel_size % 2 == 0: kernel_size += 1
     blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
     flattened = cv2.divide(gray, blurred_bg, scale=255)
@@ -151,7 +154,7 @@ def stage3_feature_detector(image: np.ndarray, params: Params) -> Optional[np.nd
 def stage4_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     h, w = image.shape[:2];
     total_area = h * w
-    scale = 300 / max(h, w)  # s4_resize_longest_edge
+    scale = 300 / max(h, w)
     small_img = cv2.resize(image, (int(w * scale), int(h * scale)))
     pixels = small_img.reshape((-1, 3)).astype(np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)

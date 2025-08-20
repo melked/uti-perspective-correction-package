@@ -16,6 +16,9 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
+# -----------------------------------------------------------------------------
+# 1. PARAMETRE YÖNETİMİ SINIFI
+# -----------------------------------------------------------------------------
 class Params:
     """ Tüm uzmanların ve yardımcı fonksiyonların kullandığı parametreleri merkezi olarak yönetir. """
 
@@ -47,7 +50,6 @@ class Params:
         self.s3_min_distance = config.get("s3_min_distance", 20)
 
         # Stage 4: İçerik Analisti
-        # <<< EKLENDİ: Gözden kaçan s4_resize_longest_edge parametresi eklendi.
         self.s4_resize_longest_edge = config.get("s4_resize_longest_edge", 300)
         self.s4_kmeans_clusters = config.get("s4_kmeans_clusters", 3)
 
@@ -56,7 +58,7 @@ class Params:
 
 
 # -----------------------------------------------------------------------------
-# 2. Geometri, Puanlama ve Yardımcı Fonksiyonlar (Değişiklik Yok)
+# 2. Geometri, Puanlama ve Yardımcı Fonksiyonlar
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -85,6 +87,14 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
+# <<< EKLENDİ: Hatanın sebebi olan eksik _unsharp_mask fonksiyonu eklendi.
+def _unsharp_mask(image: np.ndarray, strength: float) -> np.ndarray:
+    """ Görüntüyü keskinleştirerek bulanıklığı azaltır. """
+    blurred = cv2.GaussianBlur(image, (0, 0), 3)
+    sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
+    return sharpened
+
+
 def _score_candidate(contour: np.ndarray, params: Params, image_shape: tuple) -> float:
     h, w = image_shape[:2];
     total_area = w * h
@@ -108,6 +118,9 @@ def _line_intersection(line1, line2):
         return None
 
 
+# -----------------------------------------------------------------------------
+# 3. UZMAN STRATEJİLERİ
+# -----------------------------------------------------------------------------
 def stage1_fast_and_simple(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, params.s1_blur_ksize, 0)
@@ -204,6 +217,10 @@ def stage5_line_reconstructor(image: np.ndarray, params: Params) -> Optional[np.
         return quad
     return None
 
+
+# -----------------------------------------------------------------------------
+# 4. Ana Bileşen
+# -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
@@ -233,7 +250,7 @@ class PerspectiveCorrection(Component):
         h, w = src_img_orig.shape[:2]
 
         scale = self.params.resize_longest_edge / max(h, w)
-        work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)))
+        work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         work_img = _unsharp_mask(work_img, self.params.unsharp_strength)
 
         document_quad = None
@@ -270,5 +287,8 @@ class PerspectiveCorrection(Component):
         return build_response(context=self)
 
 
+# -----------------------------------------------------------------------------
+# 5. Çalıştırıcı
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

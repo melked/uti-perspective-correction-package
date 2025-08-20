@@ -92,11 +92,14 @@ def _line_intersection(line1, line2):
 # ------------------------------------------------------------------------
 # 3. ÖN İŞLEME
 # ------------------------------------------------------------------------
-def apply_clahe(img_gray, clip=2.0): return cv2.createCLAHE(clipLimit=clip, tileGridSize=(8,8)).apply(img_gray)
+def apply_clahe(img_gray, clip=2.0):
+    return cv2.createCLAHE(clipLimit=clip, tileGridSize=(8,8)).apply(img_gray)
+
 def adjust_gamma(img, gamma=1.2):
     invGamma = 1.0/gamma
     table = np.array([((i/255.0)**invGamma)*255 for i in np.arange(256)]).astype("uint8")
     return cv2.LUT(img, table)
+
 def unsharp_mask(img, amount=1.5):
     blur = cv2.GaussianBlur(img,(5,5),0)
     return cv2.addWeighted(img,1+amount,blur,-amount,0)
@@ -125,7 +128,7 @@ def detect_document_quad(img, params: Params):
 
     # --- Kontur tabanlı ---
     blurred = cv2.GaussianBlur(gray, params.blur_ksize,0)
-    edged = cv2.Canny(blurred, params.canny_min, params.canny_max)
+    edged = cv2.Canny(blurred, params.canny_min, params.canny_max)  # ✅ düzeltildi
     contours,_ = cv2.findContours(edged,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         total_area = h*w
@@ -137,7 +140,7 @@ def detect_document_quad(img, params: Params):
                 candidates.append(approx.reshape(4,2))
 
     # --- Hough Lines tabanlı ---
-    edges = cv2.Canny(gray,(params.canny_min,params.canny_max))
+    edges = cv2.Canny(gray, params.canny_min, params.canny_max)  # ✅ düzeltildi
     lines = cv2.HoughLines(edges,1,np.pi/180,int(min(h,w)*params.hough_threshold_ratio))
     if lines is not None:
         h_lines,v_lines=[],[]
@@ -155,7 +158,6 @@ def detect_document_quad(img, params: Params):
             if all(p is not None for p in pts):
                 candidates.append(np.array(pts,dtype=np.float32))
 
-    # --- En iyi aday ---
     if not candidates: return None
     best = max(candidates,key=lambda x:_score_candidate(x,img.shape))
     return best

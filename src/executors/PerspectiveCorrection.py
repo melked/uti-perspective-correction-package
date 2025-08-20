@@ -3,6 +3,7 @@ import sys
 import cv2
 import numpy as np
 import math
+from collections import defaultdict
 from typing import Optional, List, Tuple
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
@@ -15,11 +16,35 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri, Puanlama ve Yardımcı Fonksiyonlar
+# 1. PARAMETRE YÖNETİMİ SINIFI
+# -----------------------------------------------------------------------------
+class Params:
+    """ Tüm sistemin davranışını kontrol eden merkezi ayar noktası. """
+
+    def __init__(self, config=None):
+        config = config or {}
+        self.resize_longest_edge = config.get("resize_longest_edge", 1000)
+        self.unsharp_strength = config.get("unsharp_strength", 1.7)
+        self.score_min_area_ratio = config.get("score_min_area_ratio", 0.04)
+        self.score_max_area_ratio = config.get("score_max_area_ratio", 0.95)
+        self.min_score_threshold = config.get("min_score_threshold", 0.25)
+        self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
+        self.canny_min = config.get("canny_min", 50)
+        self.canny_max = config.get("canny_max", 150)
+        self.s2_blur_ratio = config.get("s2_blur_ratio", 5)
+        self.s3_max_corners = config.get("s3_max_corners", 100)
+        self.s3_quality_level = config.get("s3_quality_level", 0.01)
+        self.s3_min_distance = config.get("s3_min_distance", 20)
+        self.s4_kmeans_clusters = config.get("s4_kmeans_clusters", 3)
+        self.s5_hough_threshold_ratio = config.get("s5_hough_threshold_ratio", 4)
+
+
+# -----------------------------------------------------------------------------
+# 2. Geometri, Puanlama ve Yardımcı Fonksiyonlar
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
-    rect = np.zeros((4, 2), dtype="float32")
+    rect = np.zeros((4, 2), dtype=np.float32)
     s = pts.sum(axis=1);
     rect[0] = pts[np.argmin(s)];
     rect[2] = pts[np.argmax(s)]
@@ -44,76 +69,132 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> Optional[np.nda
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _get_angle(p1, p2, p3):
-    """ Üç noktadan bir köşenin açısını hesaplar. """
-    v1 = p1 - p2
-    v2 = p3 - p2
-    cosine_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-    return np.degrees(angle)
+def _unsharp_mask(image: np.ndarray, strength: float) -> np.ndarray:
+    blurred = cv2.GaussianBlur(image, (0, 0), 3)
+    sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
+    return sharpened
 
 
-def _score_candidate(contour: np.ndarray, image_shape: tuple) -> float:
-    """ "Süper Yargıç": Bir adayın ne kadar "belgeye benzer" olduğunu puanlar. """
+def _score_candidate(contour: np.ndarray, params: Params, image_shape: tuple) -> float:
     h, w = image_shape[:2];
     total_area = w * h
     area = cv2.contourArea(contour)
-    # Alan kontrolü
-    if not (0.01 < area / total_area < 0.98): return 0.0
-
+    if not (params.score_min_area_ratio < area / total_area < params.score_max_area_ratio): return 0.0
     peri = cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+    approx = cv2.approxPolyDP(contour, params.approx_poly_epsilon_ratio * peri, True)
     if len(approx) != 4 or not cv2.isContourConvex(approx): return 0.0
+    return area / total_area
 
-    # Sağlamlık (Doluluk) Puanı
-    hull = cv2.convexHull(contour)
-    hull_area = cv2.contourArea(hull)
-    solidity = area / hull_area if hull_area > 0 else 0
 
-    # Merkezilik Puanı
-    M = cv2.moments(approx);
-    if M["m00"] == 0: return 0.0
-    cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
-    centrality = 1.0 - (np.linalg.norm(np.array([cx, cy]) - np.array([w / 2, h / 2])) / (max(w, h) / 2))
-
-    # Açı Deformasyon Puanı (90 dereceye yakınlık)
-    points = approx.reshape(4, 2)
-    angles = [_get_angle(points[i - 1], points[i], points[(i + 1) % 4]) for i in range(4)]
-    angle_score = sum(max(0, 1 - abs(angle - 90) / 90) for angle in angles) / 4.0
-
-    return (area / total_area * 0.4) + (centrality * 0.2) + (solidity * 0.2) + (angle_score * 0.2)
+def _line_intersection(line1, line2):
+    rho1, theta1 = line1;
+    rho2, theta2 = line2
+    A = np.array([[np.cos(theta1), np.sin(theta1)], [np.cos(theta2), np.sin(theta2)]])
+    b = np.array([[rho1], [rho2]])
+    try:
+        return [int(round(c[0])) for c in np.linalg.solve(A, b)]
+    except np.linalg.LinAlgError:
+        return None
 
 
 # -----------------------------------------------------------------------------
-# 2. Aday Üretici Stratejiler
+# 3. UZMAN STRATEJİLERİ
 # -----------------------------------------------------------------------------
-def get_candidates_from_canny(gray_image: np.ndarray) -> List[np.ndarray]:
-    blurred = cv2.GaussianBlur(gray_image, (5, 5), 0)
-    v = np.median(blurred);
-    sigma = 0.33
-    lower = int(max(0, (1.0 - sigma) * v));
-    upper = int(min(255, (1.0 + sigma) * v))
-    edged = cv2.Canny(blurred, lower, upper)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel, iterations=2)
-    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    return contours
+
+def stage1_fast_and_simple(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, params.canny_min, params.canny_max)
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    if _score_candidate(c, params, image.shape) > params.min_score_threshold:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
+        return approx.reshape(4, 2).astype(np.float32)
+    return None
 
 
-def get_candidates_from_thresh(gray_image: np.ndarray) -> List[np.ndarray]:
-    kernel_size = int(min(gray_image.shape[:2]) / 5)
+def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    kernel_size = int(min(image.shape[:2]) / params.s2_blur_ratio);
     if kernel_size % 2 == 0: kernel_size += 1
-    blurred_bg = cv2.GaussianBlur(gray_image, (kernel_size, kernel_size), 0)
-    flattened = cv2.divide(gray_image, blurred_bg, scale=255)
+    blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+    flattened = cv2.divide(gray, blurred_bg, scale=255)
     _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    return contours
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    if _score_candidate(c, params, image.shape) > params.min_score_threshold:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
+        return approx.reshape(4, 2).astype(np.float32)
+    return None
+
+
+def stage3_feature_detector(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    corners = cv2.goodFeaturesToTrack(gray, maxCorners=params.s3_max_corners, qualityLevel=params.s3_quality_level,
+                                      minDistance=params.s3_min_distance)
+    if corners is None or len(corners) < 4: return None
+    hull = cv2.convexHull(corners)
+    if _score_candidate(hull, params, image.shape) > params.min_score_threshold:
+        peri = cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, params.approx_poly_epsilon_ratio * peri, True)
+        if len(approx) == 4:
+            return _order_points(approx.reshape(4, 2)).astype(np.float32)
+    return None
+
+
+def stage4_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+    h, w = image.shape[:2];
+    total_area = h * w
+    scale = 300 / max(h, w)  # s4_resize_longest_edge
+    small_img = cv2.resize(image, (int(w * scale), int(h * scale)))
+    pixels = small_img.reshape((-1, 3)).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, centers = cv2.kmeans(pixels, params.s4_kmeans_clusters, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    centers = centers.astype(np.uint8)
+    lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
+    brightest_idx = np.argmax([c[0] for c in lab_centers])
+    mask = (labels.reshape(small_img.shape[:2]) == brightest_idx).astype(np.uint8) * 255
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    if not (params.score_min_area_ratio < cv2.contourArea(c) / total_area < params.score_max_area_ratio): return None
+    rect = cv2.minAreaRect(c)
+    return cv2.boxPoints(rect).astype(np.float32)
+
+
+def stage5_line_reconstructor(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, params.canny_min, params.canny_max)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / params.s5_hough_threshold_ratio))
+    if lines is None: return None
+    h_lines, v_lines = [], []
+    for line in lines:
+        rho, theta = line[0]
+        if theta < np.pi / 4 or theta > 3 * np.pi / 4:
+            v_lines.append((rho, theta))
+        else:
+            h_lines.append((rho, theta))
+    if len(h_lines) < 2 or len(v_lines) < 2: return None
+    h_lines.sort(key=lambda x: x[0]);
+    v_lines.sort(key=lambda x: x[0])
+    corners = [_line_intersection(h_lines[0], v_lines[0]), _line_intersection(h_lines[0], v_lines[-1]),
+               _line_intersection(h_lines[-1], v_lines[-1]), _line_intersection(h_lines[-1], v_lines[0])]
+    if any(c is None for c in corners): return None
+    quad = np.array(corners, dtype=np.float32)
+    if _score_candidate(quad, params, image.shape) > 0.1:
+        return quad
+    return None
 
 
 # -----------------------------------------------------------------------------
-# 3. Ana Bileşen
+# 4. Ana Bileşen
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -121,6 +202,8 @@ class PerspectiveCorrection(Component):
         self.context = {}
         self.request.model = PackageModel(**(self.request.data))
         self.image = self.request.get_param("inputImage")
+        params_data = self.request.get_param("params", {})
+        self.params = Params(params_data)
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
@@ -141,46 +224,34 @@ class PerspectiveCorrection(Component):
         src_img_orig = self._prepare_image(img_obj.value)
         h, w = src_img_orig.shape[:2]
 
-        # Ön Hazırlık
-        scale = 1000 / max(h, w) if max(h, w) > 1000 else 1
+        scale = self.params.resize_longest_edge / max(h, w) if max(h, w) > self.params.resize_longest_edge else 1
         work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)))
-        gray_work_img = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
-
-        # --- Kolektif Akıl Stratejisi ---
-
-        # 1. Tüm uzmanlar çalışır ve aday havuzunu doldurur
-        print("Tüm uzmanlar adayları topluyor...")
-        candidate_pool = []
-        candidate_pool.extend(get_candidates_from_canny(gray_work_img))
-        candidate_pool.extend(get_candidates_from_thresh(gray_work_img))
+        work_img = _unsharp_mask(work_img, self.params.unsharp_strength)
 
         document_quad = None
         warped = None
 
-        if candidate_pool:
-            # 2. "Süper Yargıç" en iyi adayı seçer
-            print(f"{len(candidate_pool)} aday bulundu. En iyisi seçiliyor...")
-            best_candidate, best_score = None, 0.4  # Yüksek güven eşiği
-            for c in candidate_pool:
-                score = _score_candidate(c, work_img.shape)
-                if score > best_score:
-                    best_score, best_candidate = score, c
+        strategies = {
+            "Hızlı Gözcü": stage1_fast_and_simple,
+            "Sınır Gözcüsü": stage2_boundary_watcher,
+            "Noktasal Köşe Avcısı": stage3_feature_detector,
+            "İçerik Analisti": stage4_content_analyzer,
+            "Çizgi Dedektifi": stage5_line_reconstructor,
+        }
 
-            if best_candidate is not None:
-                peri = cv2.arcLength(best_candidate, True)
-                kaba_quad = cv2.approxPolyDP(best_candidate, 0.02 * peri, True).reshape(4, 2)
-
-                # 3. Son dokunuş: Hassas Ayar
-                print("En iyi aday hassaslaştırılıyor...")
-                refined_quad = _refine_corners(work_img, kaba_quad)
-
-                document_quad = refined_quad / scale
-                warped = _four_point_transform(src_img_orig, document_quad)
-                if warped is not None:
-                    print(f"Başarılı: En iyi aday {best_score:.2f} puanla bulundu ve doğrulandı.")
+        for name, strategy in strategies.items():
+            print(f"Aşama ( {name} ) deneniyor...")
+            candidate_quad_scaled = strategy(work_img, self.params)
+            if candidate_quad_scaled is not None:
+                document_quad = candidate_quad_scaled / scale
+                warped_candidate = _four_point_transform(src_img_orig, document_quad)
+                if warped_candidate is not None:
+                    print(f"Başarılı: Belge '{name}' stratejisi ile bulundu ve doğrulandı.")
+                    warped = warped_candidate
+                    break
 
         if warped is None:
-            print("Tüm uzmanlar başarısız veya geçerli aday bulunamadı. Fallback kullanılıyor.")
+            print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             warped = src_img_orig
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
@@ -192,7 +263,7 @@ class PerspectiveCorrection(Component):
 
 
 # -----------------------------------------------------------------------------
-# 4. Çalıştırıcı
+# 5. Çalıştırıcı
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

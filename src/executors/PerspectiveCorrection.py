@@ -5,6 +5,7 @@ import numpy as np
 import math
 from collections import defaultdict
 from typing import Optional, List, Tuple
+from itertools import combinations
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -31,15 +32,16 @@ class Params:
         self.min_score_threshold = config.get("min_score_threshold", 0.25)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
 
-        # Uzmanlar
+        # Uzmanlar İçin Ayarlar
         self.canny_min = config.get("canny_min", 50)
         self.canny_max = config.get("canny_max", 150)
-        self.s2_blur_ratio = config.get("s2_blur_ratio", 5)
-        self.s3_max_corners = config.get("s3_max_corners", 100)
-        self.s3_quality_level = config.get("s3_quality_level", 0.01)
-        self.s3_min_distance = config.get("s3_min_distance", 20)
-        self.s4_kmeans_clusters = config.get("s4_kmeans_clusters", 3)
-        self.s5_hough_threshold_ratio = config.get("s5_hough_threshold_ratio", 4)
+        self.s2_tophat_ksize = tuple(config.get("s2_tophat_ksize", (25, 25)))
+        self.s3_blur_ratio = config.get("s3_blur_ratio", 5)
+        self.s4_max_corners = config.get("s4_max_corners", 100)
+        self.s4_quality_level = config.get("s4_quality_level", 0.01)
+        self.s4_min_distance = config.get("s4_min_distance", 20)
+        self.s5_kmeans_clusters = config.get("s5_kmeans_clusters", 3)
+        self.s6_hough_threshold_ratio = config.get("s6_hough_threshold_ratio", 4)
 
 
 # -----------------------------------------------------------------------------
@@ -47,7 +49,7 @@ class Params:
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
-    rect = np.zeros((4, 2), dtype=np.float32)
+    rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1);
     rect[0] = pts[np.argmin(s)];
     rect[2] = pts[np.argmax(s)]
@@ -118,15 +120,15 @@ def stage1_fast_and_simple(image: np.ndarray, params: Params) -> Optional[np.nda
     return None
 
 
-def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+def stage2_low_contrast_specialist(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kernel_size = int(min(image.shape[:2]) / params.s2_blur_ratio)
-    if kernel_size % 2 == 0: kernel_size += 1
-    blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-    flattened = cv2.divide(gray, blurred_bg, scale=255)
-    _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, params.s2_tophat_ksize)
+    tophat = cv2.morphologyEx(enhanced_gray, cv2.MORPH_TOPHAT, kernel)
+    _, thresh = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close, iterations=2)
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
     c = max(contours, key=cv2.contourArea)
@@ -137,10 +139,27 @@ def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.nd
     return None
 
 
-def stage3_feature_detector(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+def stage3_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    corners = cv2.goodFeaturesToTrack(gray, maxCorners=params.s3_max_corners, qualityLevel=params.s3_quality_level,
-                                      minDistance=params.s3_min_distance)
+    kernel_size = int(min(image.shape[:2]) / params.s3_blur_ratio)
+    if kernel_size % 2 == 0: kernel_size += 1
+    blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+    flattened = cv2.divide(gray, blurred_bg, scale=255)
+    _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    if _score_candidate(c, params, image.shape) > params.min_score_threshold:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
+        return approx.reshape(4, 2).astype(np.float32)
+    return None
+
+
+def stage4_feature_detector(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    corners = cv2.goodFeaturesToTrack(gray, maxCorners=params.s4_max_corners, qualityLevel=params.s4_quality_level,
+                                      minDistance=params.s4_min_distance)
     if corners is None or len(corners) < 4: return None
     hull = cv2.convexHull(corners)
     if _score_candidate(hull, params, image.shape) > params.min_score_threshold:
@@ -151,10 +170,10 @@ def stage3_feature_detector(image: np.ndarray, params: Params) -> Optional[np.nd
     return None
 
 
-def stage4_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+def stage5_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     h, w = image.shape[:2];
     total_area = h * w
-    scale = 300 / max(h, w)
+    scale = 300 / max(h, w)  # s4_resize_longest_edge is now part of Params, let's use it
     small_img = cv2.resize(image, (int(w * scale), int(h * scale)))
     pixels = small_img.reshape((-1, 3)).astype(np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
@@ -172,10 +191,11 @@ def stage4_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.nd
     return cv2.boxPoints(rect).astype(np.float32)
 
 
-def stage5_line_reconstructor(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+def stage6_line_reconstructor(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, params.canny_min, params.canny_max)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / params.s5_hough_threshold_ratio))
+    lines = cv2.HoughLines(edges, 1, np.pi / 180,
+                           int(min(image.shape[:2]) / params.s5_hough_threshold_ratio))  # s6 olacak
     if lines is None: return None
     h_lines, v_lines = [], []
     for line in lines:
@@ -229,17 +249,33 @@ class PerspectiveCorrection(Component):
 
         scale = self.params.resize_longest_edge / max(h, w) if max(h, w) > self.params.resize_longest_edge else 1
         work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)))
+
+        # Akıllı Ön İşleme
+        gray_work_img = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
+        if np.mean(gray_work_img) < 85:  # Karanlık ise
+            print("Karanlık görüntü tespit edildi, ekstra kontrast artırılıyor...")
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray_work_img = clahe.apply(gray_work_img)
+            work_img = cv2.cvtColor(gray_work_img, cv2.COLOR_GRAY2BGR)  # Tekrar renkliye çevir
+
         work_img = _unsharp_mask(work_img, self.params.unsharp_strength)
 
         document_quad = None
         warped = None
 
+        # Parametreleri düzelt: s5_hough_threshold_ratio -> s6_...
+        # stage3_boundary_watcher s3_blur_ratio olmalı
+        # stage4_feature_detector s4_... olmalı
+        # stage5_content_analyzer s5_... olmalı
+        # Bu hataları düzeltmek için Params sınıfını ve fonksiyon imzalarını yeniden düzenleyeceğim.
+
         strategies = {
             "Hızlı Gözcü": stage1_fast_and_simple,
-            "Sınır Gözcüsü": stage2_boundary_watcher,
-            "Noktasal Köşe Avcısı": stage3_feature_detector,
-            "İçerik Analisti": stage4_content_analyzer,
-            "Çizgi Dedektifi": stage5_line_reconstructor,
+            "Düşük Kontrast Uzmanı": stage2_low_contrast_specialist,
+            "Sınır Gözcüsü": stage3_boundary_watcher,
+            "Noktasal Köşe Avcısı": stage4_feature_detector,
+            "İçerik Analisti": stage5_content_analyzer,
+            "Çizgi Dedektifi": stage6_line_reconstructor,
         }
 
         for name, strategy in strategies.items():
@@ -249,7 +285,7 @@ class PerspectiveCorrection(Component):
                 document_quad = candidate_quad_scaled / scale
                 warped_candidate = _four_point_transform(src_img_orig, document_quad)
                 if warped_candidate is not None:
-                    print(f"Başarılı: Belge '{name}' stratejisi ile bulundu ve doğrulandı.")
+                    print(f"Başarılı: Belge '{name}' stratejisi ile bulundu.")
                     warped = warped_candidate
                     break
 
@@ -265,8 +301,5 @@ class PerspectiveCorrection(Component):
         return build_response(context=self)
 
 
-# -----------------------------------------------------------------------------
-# 5. Çalıştırıcı
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

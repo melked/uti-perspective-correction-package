@@ -3,7 +3,9 @@ import sys
 import cv2
 import numpy as np
 import math
+from collections import defaultdict
 from typing import Optional, List, Tuple
+from itertools import combinations
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -48,67 +50,128 @@ def _score_candidate(contour: np.ndarray, image_shape: tuple) -> float:
     h, w = image_shape[:2];
     total_area = w * h
     area = cv2.contourArea(contour)
-    if not (0.02 < area / total_area < 0.95): return 0.0
-
+    if not (0.03 < area / total_area < 0.95): return 0.0
     peri = cv2.arcLength(contour, True)
     approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
     if len(approx) != 4 or not cv2.isContourConvex(approx): return 0.0
-
     hull = cv2.convexHull(contour)
     hull_area = cv2.contourArea(hull)
     if hull_area == 0: return 0.0
     solidity = area / hull_area
-
     M = cv2.moments(approx);
     if M["m00"] == 0: return 0.0
     cx = M["m10"] / M["m00"];
     cy = M["m01"] / M["m00"]
     centrality_score = 1.0 - (np.linalg.norm(np.array([cx, cy]) - np.array([w / 2, h / 2])) / (max(w, h) / 2))
+    return (area / total_area * 0.4) + (centrality_score * 0.4) + (solidity * 0.2)
 
-    return (area / total_area * 0.5) + (centrality_score * 0.3) + (solidity * 0.2)
+
+def _line_intersection(line1, line2):
+    rho1, theta1 = line1;
+    rho2, theta2 = line2
+    A = np.array([[np.cos(theta1), np.sin(theta1)], [np.cos(theta2), np.sin(theta2)]])
+    b = np.array([[rho1], [rho2]])
+    try:
+        x0, y0 = np.linalg.solve(A, b)
+        return [int(round(x0[0])), int(round(y0[0]))]
+    except np.linalg.LinAlgError:
+        return None
 
 
 # -----------------------------------------------------------------------------
-# Piramidin Katmanları: Stratejiler
+# UZMAN STRATEJİLERİ
 # -----------------------------------------------------------------------------
-
-def find_best_candidate_from_pool(image: np.ndarray) -> Optional[np.ndarray]:
-    """ ANA STRATEJİ: Farklı maskelerden aday havuzu oluşturur ve en iyisini seçer. """
+def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 50, 150)
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+    if len(approx) == 4 and cv2.isContourConvex(approx) and _score_candidate(c, image.shape) > 0.2:
+        return approx.reshape(4, 2).astype(np.float32)
+    return None
 
-    # Aydınlatma Normalizasyonu (Sınır Gözcüsü tekniği)
-    kernel_size = int(min(gray.shape[:2]) / 5)
+
+def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    kernel_size = int(min(image.shape[:2]) / 5);
     if kernel_size % 2 == 0: kernel_size += 1
     blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
     flattened = cv2.divide(gray, blurred_bg, scale=255)
+    _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+    if len(approx) == 4 and cv2.isContourConvex(approx) and _score_candidate(c, image.shape) > 0.2:
+        return approx.reshape(4, 2).astype(np.float32)
+    return None
 
-    # 3 Farklı Maske Üretimi
-    _, mask_flat = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    mask_canny = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 120)
-    mask_adaptive = cv2.adaptiveThreshold(cv2.GaussianBlur(gray, (7, 7), 0), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                          cv2.THRESH_BINARY_INV, 21, 5)
 
-    # Aday Havuzunu Oluştur
-    candidate_pool = []
-    for mask in [mask_flat, mask_canny, mask_adaptive]:
-        # Gürültüyü temizle ve delikleri kapat
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        cleaned_mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        candidate_pool.extend(contours)
+def stage3_feature_detector(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    corners = cv2.goodFeaturesToTrack(gray, maxCorners=100, qualityLevel=0.01, minDistance=20)
+    if corners is None or len(corners) < 4: return None
+    hull = cv2.convexHull(corners)
+    peri = cv2.arcLength(hull, True)
+    approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+    if len(approx) == 4 and cv2.isContourConvex(approx) and _score_candidate(hull, image.shape) > 0.2:
+        return approx.reshape(4, 2).astype(np.float32)
+    return None
 
-    if not candidate_pool: return None
 
-    # Havuzdaki en iyi adayı bul
-    best_candidate, best_score = None, 0.3  # Minimum geçme notu
-    for c in sorted(candidate_pool, key=cv2.contourArea, reverse=True)[:30]:  # En büyük 30 adayı değerlendir
-        score = _score_candidate(c, image.shape)
-        if score > best_score:
-            best_score = score
-            peri = cv2.arcLength(c, True)
-            best_candidate = cv2.approxPolyDP(c, 0.02 * peri, True)
+def stage4_content_analyzer(image: np.ndarray) -> Optional[np.ndarray]:
+    h, w = image.shape[:2];
+    total_area = h * w
+    scale = 300 / max(h, w)
+    small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    pixels = small_img.reshape((-1, 3)).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+    _, labels, centers = cv2.kmeans(pixels, 3, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    centers = centers.astype(np.uint8)
+    lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
+    brightest_idx = np.argmax([c[0] for c in lab_centers])
+    mask = (labels.reshape(small_img.shape[:2]) == brightest_idx).astype(np.uint8) * 255
+    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    if not (0.05 < cv2.contourArea(c) / total_area < 0.95): return None
+    rect = cv2.minAreaRect(c)
+    box = cv2.boxPoints(rect)
+    return box.astype(np.float32)
 
-    return best_candidate.reshape(4, 2).astype(np.float32) if best_candidate is not None else None
+
+def stage5_line_reconstructor(image: np.ndarray) -> Optional[np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / 4))
+    if lines is None: return None
+    h_lines, v_lines = [], []
+    for line in lines:
+        rho, theta = line[0]
+        if theta < np.pi / 4 or theta > 3 * np.pi / 4:
+            v_lines.append((rho, theta))
+        else:
+            h_lines.append((rho, theta))
+    if len(h_lines) < 2 or len(v_lines) < 2: return None
+    h_lines.sort(key=lambda x: x[0]);
+    v_lines.sort(key=lambda x: x[0])
+    corners = [_line_intersection(h_lines[0], v_lines[0]), _line_intersection(h_lines[0], v_lines[-1]),
+               _line_intersection(h_lines[-1], v_lines[-1]), _line_intersection(h_lines[-1], v_lines[0])]
+    if any(c is None for c in corners): return None
+    quad = np.array(corners, dtype=np.float32)
+    if _score_candidate(quad, image.shape) > 0.1:  # Düşük bir eşik bile yeterli
+        return quad
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -137,35 +200,35 @@ class PerspectiveCorrection(Component):
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
-        src_img_orig = self._prepare_image(img_obj.value)
-        h, w = src_img_orig.shape[:2]
-
-        # --- PİRAMİT STRATEJİSİ DEVREDE ---
-
-        # KATMAN 1: Görüntü Standardizasyonu
-        scale = 1000 / max(h, w)  # Dinamik boyutlandırma
-        resized_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        # Keskinleştirme
-        sharpened_img = cv2.addWeighted(resized_img, 1.8, cv2.GaussianBlur(resized_img, (0, 0), 3), -0.8, 0)
+        src_img = self._prepare_image(img_obj.value)
+        h, w = src_img.shape[:2]
 
         document_quad = None
+        warped = None
 
-        # KATMAN 2: Akıllı Aday Tespiti
-        print("Piramidin ana katmanı (Akıllı Aday Tespiti) deneniyor...")
-        document_quad = find_best_candidate_from_pool(sharpened_img)
+        strategies = {
+            "Hızlı Gözcü": stage1_fast_and_simple,
+            "Sınır Gözcüsü": stage2_boundary_watcher,
+            "Noktasal Köşe Avcısı": stage3_feature_detector,
+            "İçerik Analisti": stage4_content_analyzer,
+            "Çizgi Dedektifi": stage5_line_reconstructor,
+        }
 
-        # KATMAN 3: Özel Durumlar (Gerekirse Hough, K-Means vb. buraya eklenebilir)
+        for name, strategy in strategies.items():
+            print(f"Aşama ( {name} ) deneniyor...")
+            candidate_quad = strategy(src_img)
+            if candidate_quad is not None:
+                warped_candidate = _four_point_transform(src_img, candidate_quad)
+                if warped_candidate is not None:
+                    print(f"Başarılı: Belge '{name}' stratejisi ile bulundu.")
+                    document_quad = candidate_quad
+                    warped = warped_candidate
+                    break
 
-        if document_quad is not None:
-            document_quad /= scale  # Köşeleri orijinal görüntü boyutuna geri getir
-            print("Başarılı: Uygun bir belge adayı bulundu.")
-        else:
-            print("Tüm katmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
-            document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-
-        warped = _four_point_transform(src_img_orig, document_quad)
         if warped is None:
-            warped = src_img_orig
+            print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
+            warped = src_img
+            document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)

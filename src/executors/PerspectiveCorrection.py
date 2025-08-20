@@ -5,7 +5,6 @@ import numpy as np
 import math
 from collections import defaultdict
 from typing import Optional, List, Tuple
-from itertools import combinations
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -127,9 +126,7 @@ def stage2_low_contrast_specialist(image: np.ndarray, params: Params) -> Optiona
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, params.s2_tophat_ksize)
     tophat = cv2.morphologyEx(enhanced_gray, cv2.MORPH_TOPHAT, kernel)
     _, thresh = cv2.threshold(tophat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
     c = max(contours, key=cv2.contourArea)
     if _score_candidate(c, params, image.shape) > params.min_score_threshold:
@@ -173,11 +170,11 @@ def stage4_feature_detector(image: np.ndarray, params: Params) -> Optional[np.nd
 def stage5_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     h, w = image.shape[:2];
     total_area = h * w
-    scale = 300 / max(h, w)  # s4_resize_longest_edge is now part of Params, let's use it
+    scale = 300 / max(h, w)
     small_img = cv2.resize(image, (int(w * scale), int(h * scale)))
     pixels = small_img.reshape((-1, 3)).astype(np.float32)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, centers = cv2.kmeans(pixels, params.s4_kmeans_clusters, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    _, labels, centers = cv2.kmeans(pixels, params.s5_kmeans_clusters, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
     centers = centers.astype(np.uint8)
     lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
     brightest_idx = np.argmax([c[0] for c in lab_centers])
@@ -194,8 +191,7 @@ def stage5_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.nd
 def stage6_line_reconstructor(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, params.canny_min, params.canny_max)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180,
-                           int(min(image.shape[:2]) / params.s5_hough_threshold_ratio))  # s6 olacak
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / params.s6_hough_threshold_ratio))
     if lines is None: return None
     h_lines, v_lines = [], []
     for line in lines:
@@ -250,24 +246,17 @@ class PerspectiveCorrection(Component):
         scale = self.params.resize_longest_edge / max(h, w) if max(h, w) > self.params.resize_longest_edge else 1
         work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)))
 
-        # Akıllı Ön İşleme
         gray_work_img = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
-        if np.mean(gray_work_img) < 85:  # Karanlık ise
+        if np.mean(gray_work_img) < 85:
             print("Karanlık görüntü tespit edildi, ekstra kontrast artırılıyor...")
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray_work_img = clahe.apply(gray_work_img)
-            work_img = cv2.cvtColor(gray_work_img, cv2.COLOR_GRAY2BGR)  # Tekrar renkliye çevir
+            work_img = cv2.cvtColor(gray_work_img, cv2.COLOR_GRAY2BGR)
 
         work_img = _unsharp_mask(work_img, self.params.unsharp_strength)
 
         document_quad = None
         warped = None
-
-        # Parametreleri düzelt: s5_hough_threshold_ratio -> s6_...
-        # stage3_boundary_watcher s3_blur_ratio olmalı
-        # stage4_feature_detector s4_... olmalı
-        # stage5_content_analyzer s5_... olmalı
-        # Bu hataları düzeltmek için Params sınıfını ve fonksiyon imzalarını yeniden düzenleyeceğim.
 
         strategies = {
             "Hızlı Gözcü": stage1_fast_and_simple,

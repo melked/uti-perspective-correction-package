@@ -5,7 +5,6 @@ import numpy as np
 import math
 from collections import defaultdict
 from typing import Optional, List, Tuple
-from itertools import combinations
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -17,7 +16,7 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. Geometri, Puanlama ve Yardımcı Fonksiyonlar
+# 1. Geometri, Puanlama ve Hassas Ayar Fonksiyonları
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -44,6 +43,15 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+
+
+def _refine_corners(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    winSize = (11, 11)
+    zeroZone = (-1, -1)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+    refined_corners = cv2.cornerSubPix(gray, corners.astype(np.float32), winSize, zeroZone, criteria)
+    return refined_corners
 
 
 def _line_intersection(line1, line2):
@@ -205,12 +213,14 @@ class PerspectiveCorrection(Component):
             candidate_quad = strategy(src_img)
 
             if candidate_quad is not None:
-                # 'Hassas Ayar' adımı kaldırıldı. Direkt adayın sonucunu kullanıyoruz.
-                warped_candidate = _four_point_transform(src_img, candidate_quad)
+                print(f"'{name}' ile kaba aday bulundu. Köşeler hassaslaştırılıyor...")
+                refined_quad = _refine_corners(src_img, candidate_quad)
+
+                warped_candidate = _four_point_transform(src_img, refined_quad)
 
                 if warped_candidate is not None:
                     print(f"Başarılı: Belge '{name}' stratejisi ile bulundu ve doğrulandı.")
-                    document_quad = candidate_quad
+                    document_quad = refined_quad
                     warped = warped_candidate
                     break
                 else:

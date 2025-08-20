@@ -3,9 +3,7 @@ import sys
 import cv2
 import numpy as np
 import math
-from collections import defaultdict
-from typing import Optional, List, Tuple
-from itertools import combinations
+from typing import Optional
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -17,45 +15,7 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. PARAMETRE YÖNETİMİ SINIFI
-# -----------------------------------------------------------------------------
-class Params:
-    """ Tüm uzmanların ve yardımcı fonksiyonların kullandığı parametreleri merkezi olarak yönetir. """
-
-    def __init__(self, config=None):
-        config = config or {}
-        # Genel Parametreler
-        self.score_min_area_ratio = config.get("score_min_area_ratio", 0.03)
-        self.score_max_area_ratio = config.get("score_max_area_ratio", 0.95)
-        self.score_min_threshold = config.get("score_min_threshold", 0.25)
-        # <<< EKLENDİ: Gözden kaçan approx_poly_epsilon_ratio parametresi eklendi.
-        self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
-
-        # Stage 1: Hızlı Gözcü
-        self.s1_blur_ksize = tuple(config.get("s1_blur_ksize", (5, 5)))
-        self.canny_min = config.get("canny_min", 50)
-        self.canny_max = config.get("canny_max", 150)
-
-        # Stage 2: Sınır Gözcüsü
-        self.s2_blur_ratio = config.get("s2_blur_ratio", 5)
-        self.s2_morph_ksize = tuple(config.get("s2_morph_ksize", (7, 7)))
-        self.s2_morph_iter = config.get("s2_morph_iter", 3)
-
-        # Stage 3: Noktasal Köşe Avcısı
-        self.s3_max_corners = config.get("s3_max_corners", 100)
-        self.s3_quality_level = config.get("s3_quality_level", 0.01)
-        self.s3_min_distance = config.get("s3_min_distance", 20)
-
-        # Stage 4: İçerik Analisti
-        self.s4_resize_longest_edge = config.get("s4_resize_longest_edge", 300)
-        self.s4_kmeans_clusters = config.get("s4_kmeans_clusters", 3)
-
-        # Stage 5: Çizgi Dedektifi
-        self.s5_hough_threshold_ratio = config.get("s5_hough_threshold_ratio", 4)
-
-
-# -----------------------------------------------------------------------------
-# 2. Geometri, Puanlama ve Yardımcı Fonksiyonlar (Değişiklik Yok)
+# 1. Geometri ve Yardımcı Fonksiyonlar
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -84,131 +44,74 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _score_candidate(contour: np.ndarray, params: Params, image_shape: tuple) -> float:
-    h, w = image_shape[:2];
-    total_area = w * h
-    area = cv2.contourArea(contour)
-    if not (params.score_min_area_ratio < area / total_area < params.score_max_area_ratio): return 0.0
-    peri = cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, params.approx_poly_epsilon_ratio * peri, True)
-    if len(approx) != 4 or not cv2.isContourConvex(approx): return 0.0
-    return area / total_area
-
-
-def _line_intersection(line1, line2):
-    rho1, theta1 = line1;
-    rho2, theta2 = line2
-    A = np.array([[np.cos(theta1), np.sin(theta1)], [np.cos(theta2), np.sin(theta2)]])
-    b = np.array([[rho1], [rho2]])
-    try:
-        x0, y0 = np.linalg.solve(A, b)
-        return [int(round(x0[0])), int(round(y0[0]))]
-    except np.linalg.LinAlgError:
-        return None
-
-
 # -----------------------------------------------------------------------------
-# 3. UZMAN STRATEJİLERİ (Değişiklik Yok, Sadece artık params'tan okuyorlar)
+# 2. Nihai Tespit Stratejisi: Hibrit Ön İşleme Hunisi
 # -----------------------------------------------------------------------------
-def stage1_fast_and_simple(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, params.s1_blur_ksize, 0)
-    edged = cv2.Canny(blurred, params.canny_min, params.canny_max)
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
-    c = max(contours, key=cv2.contourArea)
-    peri = cv2.arcLength(c, True)
-    approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
-    if len(approx) == 4 and cv2.isContourConvex(approx) and _score_candidate(c, params,
-                                                                             image.shape) > params.score_min_threshold:
-        return approx.reshape(4, 2).astype(np.float32)
-    return None
+def find_document_with_hybrid_preprocessing(image: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Farklı ön işleme tekniklerinin en iyi yanlarını birleştirerek tek ve sağlam bir maske oluşturur,
+    ve bu maskeden en olası belge dörtgenini çıkarır.
+    """
+    orig_h, orig_w = image.shape[:2]
 
+    # Adım 1: Görüntü Standardizasyonu
+    scale = 800 / max(orig_h, orig_w)
+    resized = cv2.resize(image, (int(orig_w * scale), int(orig_h * scale)))
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
-def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kernel_size = int(min(image.shape[:2]) / params.s2_blur_ratio)
+    # Adım 2: Çok Kanallı Analiz İçin Girdileri Hazırla
+    # "Süper Göz": Aydınlatması düzleştirilmiş görüntü
+    kernel_size = int(min(gray.shape[:2]) / 5);
     if kernel_size % 2 == 0: kernel_size += 1
     blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
     flattened = cv2.divide(gray, blurred_bg, scale=255)
-    _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, params.s2_morph_ksize)
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=params.s2_morph_iter)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
-    c = max(contours, key=cv2.contourArea)
-    peri = cv2.arcLength(c, True)
-    approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
-    if len(approx) == 4 and cv2.isContourConvex(approx) and _score_candidate(c, params,
-                                                                             image.shape) > params.score_min_threshold:
-        return approx.reshape(4, 2).astype(np.float32)
-    return None
 
+    # "Normal Göz": Standart bulanıklaştırılmış görüntü
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-def stage3_feature_detector(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    corners = cv2.goodFeaturesToTrack(gray, maxCorners=params.s3_max_corners, qualityLevel=params.s3_quality_level,
-                                      minDistance=params.s3_min_distance)
-    if corners is None or len(corners) < 4: return None
-    hull = cv2.convexHull(corners)
-    if _score_candidate(hull, params, image.shape) > params.score_min_threshold:
-        peri = cv2.arcLength(hull, True)
-        approx = cv2.approxPolyDP(hull, params.approx_poly_epsilon_ratio * peri, True)
-        if len(approx) == 4:
-            return _order_points(approx.reshape(4, 2)).astype(np.float32)
-    return None
+    # Adım 3: Hibrit Kenar Haritası Oluştur
+    # Canny, net detayları yakalar
+    canny_edges = cv2.Canny(blurred, 50, 150)
+    # Eşikleme, genel silüeti yakalar
+    _, flat_thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
+    # İki haritayı birleştirerek en iyi yanlarını al
+    hybrid_map = cv2.bitwise_or(canny_edges, flat_thresh)
 
-def stage4_content_analyzer(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
-    h, w = image.shape[:2];
-    total_area = h * w
-    scale = params.s4_resize_longest_edge / max(h, w)
-    small_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-    pixels = small_img.reshape((-1, 3)).astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-    _, labels, centers = cv2.kmeans(pixels, params.s4_kmeans_clusters, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-    centers = centers.astype(np.uint8)
-    lab_centers = cv2.cvtColor(centers.reshape(1, -1, 3), cv2.COLOR_BGR2LAB)[0]
-    brightest_idx = np.argmax([c[0] for c in lab_centers])
-    mask = (labels.reshape(small_img.shape[:2]) == brightest_idx).astype(np.uint8) * 255
-    mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    # Adım 4: "Süper Morfoloji" ile Maskeyi Mükemmelleştir
+    # Spiralli defterler ve yazılar gibi büyük boşlukları doldurmak için büyük bir kernel
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    closed = cv2.morphologyEx(hybrid_map, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    # Küçük gürültüleri temizle
+    closed = cv2.erode(closed, None, iterations=2)
+    closed = cv2.dilate(closed, None, iterations=1)
+
+    # Adım 5: Nihai Köşe Tespiti
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
+    if not contours:
+        return None
+
     c = max(contours, key=cv2.contourArea)
-    if not (params.score_min_area_ratio < cv2.contourArea(c) / total_area < params.score_max_area_ratio): return None
+
+    # Güvenlik Kontrolü: Alan çok küçük veya çok büyükse reddet
+    area = cv2.contourArea(c)
+    total_area = closed.shape[0] * closed.shape[1]
+    if not (0.05 < area / total_area < 0.95):
+        return None
+
+    # En sağlam köşe bulma yöntemi olarak minAreaRect kullan
     rect = cv2.minAreaRect(c)
     box = cv2.boxPoints(rect)
+
+    # Köşeleri orijinal görüntü boyutuna geri ölçekle
+    box /= scale
+
     return box.astype(np.float32)
 
 
-def stage5_line_reconstructor(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), params.canny_min, params.canny_max)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, int(min(image.shape[:2]) / params.s5_hough_threshold_ratio))
-    if lines is None: return None
-    h_lines, v_lines = [], []
-    for line in lines:
-        rho, theta = line[0]
-        if theta < np.pi / 4 or theta > 3 * np.pi / 4:
-            v_lines.append((rho, theta))
-        else:
-            h_lines.append((rho, theta))
-    if len(h_lines) < 2 or len(v_lines) < 2: return None
-    h_lines.sort(key=lambda x: x[0]);
-    v_lines.sort(key=lambda x: x[0])
-    corners = [_line_intersection(h_lines[0], v_lines[0]), _line_intersection(h_lines[0], v_lines[-1]),
-               _line_intersection(h_lines[-1], v_lines[-1]), _line_intersection(h_lines[-1], v_lines[0])]
-    if any(c is None for c in corners): return None
-    quad = np.array(corners, dtype=np.float32)
-    if _score_candidate(quad, params, image.shape) > 0.1:
-        return quad
-    return None
-
-
 # -----------------------------------------------------------------------------
-# 4. Ana Bileşen
+# Ana Bileşen
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -216,8 +119,6 @@ class PerspectiveCorrection(Component):
         self.context = {}
         self.request.model = PackageModel(**(self.request.data))
         self.image = self.request.get_param("inputImage")
-        params_data = self.request.get_param("params", {})
-        self.params = Params(params_data)
 
     @staticmethod
     def bootstrap(config: dict) -> dict:
@@ -239,31 +140,19 @@ class PerspectiveCorrection(Component):
         h, w = src_img.shape[:2]
 
         document_quad = None
-        warped = None
 
-        strategies = {
-            "Hızlı Gözcü": stage1_fast_and_simple,
-            "Sınır Gözcüsü": stage2_boundary_watcher,
-            "Noktasal Köşe Avcısı": stage3_feature_detector,
-            "İçerik Analisti": stage4_content_analyzer,
-            "Çizgi Dedektifi": stage5_line_reconstructor,
-        }
+        print("Hibrit Ön İşleme Hunisi stratejisi deneniyor...")
+        document_quad = find_document_with_hybrid_preprocessing(src_img)
 
-        for name, strategy in strategies.items():
-            print(f"Aşama ( {name} ) deneniyor...")
-            candidate_quad = strategy(src_img, self.params)
-            if candidate_quad is not None:
-                warped_candidate = _four_point_transform(src_img, candidate_quad)
-                if warped_candidate is not None:
-                    print(f"Başarılı: Belge '{name}' stratejisi ile bulundu ve doğrulandı.")
-                    document_quad = candidate_quad
-                    warped = warped_candidate
-                    break
-
-        if warped is None:
-            print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
-            warped = src_img
+        if document_quad is not None:
+            print("Başarılı: Uygun bir belge adayı bulundu.")
+        else:
+            print("Hibrit strateji başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+
+        warped = _four_point_transform(src_img, document_quad)
+        if warped is None:
+            warped = src_img
 
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
@@ -273,7 +162,6 @@ class PerspectiveCorrection(Component):
 
 
 # -----------------------------------------------------------------------------
-# 5. Çalıştırıcı
+# Çalıştırıcı
 # -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    Executor(sys.argv[1]).run()
+Executor(sys.argv[1]).run()

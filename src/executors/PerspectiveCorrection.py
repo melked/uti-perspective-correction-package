@@ -47,27 +47,31 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 def _unsharp_mask(image: np.ndarray, strength: float = 1.5, kernel_size: tuple = (5, 5)) -> np.ndarray:
     """ Görüntüyü keskinleştirerek bulanıklığı azaltır. """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image
+
     blurred = cv2.GaussianBlur(gray, kernel_size, 0)
     sharpened = cv2.addWeighted(gray, 1.0 + strength, blurred, -strength, 0)
-    return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+    if image.ndim == 3:
+        return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+    return sharpened
 
 
 def find_best_quad_from_contours(contours: list, image_shape: tuple) -> Optional[np.ndarray]:
     if not contours: return None
-    best_quad, best_score = None, 0.2
-    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+    best_quad, best_score = None, 0.1  # Daha esnek bir başlangıç skoru
+    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:7]:
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
-            # Basit bir alan ve merkezilik puanlaması
             area = cv2.contourArea(approx)
             total_area = image_shape[0] * image_shape[1]
             if not (0.05 < area / total_area < 0.95): continue
 
-            M = cv2.moments(approx)
-            if M["m00"] == 0: continue
-            score = area / total_area
+            score = area / total_area  # Basit alan puanlaması
             if score > best_score:
                 best_score = score
                 best_quad = approx
@@ -80,33 +84,29 @@ def find_best_quad_from_contours(contours: list, image_shape: tuple) -> Optional
 
 def stage1_fast_and_simple(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, 50, 150)
-    # Gürültüden kaynaklanan küçük kopuklukları birleştir
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edged = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
+    # Bulanık görüntüler için Canny eşikleri daha gevşek ayarlandı
+    edged = cv2.Canny(gray, 30, 100)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edged = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel, iterations=2)
     contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     return find_best_quad_from_contours(contours, image.shape)
 
 
 def stage2_boundary_watcher(image: np.ndarray) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kernel_size = int(min(image.shape[:2]) / 5)
+    kernel_size = int(min(image.shape[:2]) / 4)  # Daha agresif arka plan tahmini
     if kernel_size % 2 == 0: kernel_size += 1
     blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
     flattened = cv2.divide(gray, blurred_bg, scale=255)
     _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # <<< DEĞİŞİKLİK: Bulanık kenarlardan gelen "puslu" maskeyi daha iyi toparlamak için daha agresif morfoloji
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    # Bulanık kenarları toparlamak için daha güçlü morfolojik operasyonlar
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=4)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     return find_best_quad_from_contours(contours, image.shape)
 
-
-# ... (stage3 ve stage4 fonksiyonları, bu senaryo için daha az etkili olduklarından
-#      veya zaten bulanıklığa bir miktar dayanıklı olduklarından şimdilik değiştirilmedi.)
 
 # -----------------------------------------------------------------------------
 # Ana Bileşen
@@ -136,20 +136,17 @@ class PerspectiveCorrection(Component):
         if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
         src_img_orig = self._prepare_image(img_obj.value)
 
-        # <<< YENİ ADIM: "Önleyici Saldırı"
-        # Tespit işlemine başlamadan önce görüntüyü keskinleştiriyoruz.
+        # <<< YENİ ADIM: Görüntüyü bulanıklığa karşı en başta keskinleştiriyoruz.
         print("Görüntü bulanıklığa karşı keskinleştiriliyor...")
-        src_img = _unsharp_mask(src_img_orig)
+        src_img = _unsharp_mask(src_img_orig, strength=2.0)  # Keskinlik gücü artırıldı
 
         h, w = src_img.shape[:2]
-
         document_quad = None
         warped = None
 
         strategies = {
             "Hızlı Gözcü": stage1_fast_and_simple,
             "Sınır Gözcüsü": stage2_boundary_watcher,
-            # Gerekirse diğer uzmanlar da eklenebilir
         }
 
         for name, strategy in strategies.items():
@@ -157,7 +154,7 @@ class PerspectiveCorrection(Component):
             candidate_quad = strategy(src_img)
 
             if candidate_quad is not None:
-                # ÖNEMLİ: Dönüşümü keskinleştirilmiş görüntüde değil, orijinal görüntüde yapıyoruz.
+                # ÖNEMLİ: Dönüşümü orijinal, bozulmamış görüntüde yapıyoruz.
                 warped_candidate = _four_point_transform(src_img_orig, candidate_quad)
 
                 if warped_candidate is not None:
@@ -172,6 +169,13 @@ class PerspectiveCorrection(Component):
             print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             warped = src_img_orig
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+
+        # Son çıktıya ek bir parlaklık/kontrast ayarı yapalım
+        if np.mean(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)) < 100:
+            # Düşük ışıklıysa gama düzeltmesi uygula
+            invGamma = 1.0 / 1.2
+            table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
+            warped = cv2.LUT(warped, table)
 
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)

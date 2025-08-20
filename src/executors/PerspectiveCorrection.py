@@ -2,9 +2,6 @@ import os
 import sys
 import cv2
 import numpy as np
-import math
-from collections import defaultdict
-from typing import Optional, List, Tuple
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -19,35 +16,30 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 # 1. PARAMETRE YÖNETİMİ SINIFI
 # -----------------------------------------------------------------------------
 class Params:
-    """ Tüm uzmanların ve yardımcı fonksiyonların kullandığı parametreleri merkezi olarak yönetir. """
+    """ Algoritmanın kullandığı tüm parametreleri merkezi olarak yönetir. """
 
     def __init__(self, config=None):
         config = config or {}
-        # Genel
+        # Ön İşleme Parametreleri
         self.resize_longest_edge = config.get("resize_longest_edge", 1000)
-        self.unsharp_strength = config.get("unsharp_strength", 1.5)
+        self.blur_ksize = tuple(config.get("blur_ksize", (5, 5)))
+
+        # Canny Kenar Tespiti Parametreleri
+        self.canny_min = config.get("canny_min", 75)
+        self.canny_max = config.get("canny_max", 200)
+
+        # goodFeaturesToTrack (Köşe Tespiti) Parametreleri
+        self.feature_max_corners = config.get("feature_max_corners", 20)
+        self.feature_quality_level = config.get("feature_quality_level", 0.01)
+        self.feature_min_distance = config.get("feature_min_distance", 20)
+
+        # Kontur Tabanlı Yedek Yöntem Parametreleri
+        self.contour_min_area_ratio = config.get("contour_min_area_ratio", 0.1)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
-
-        # Puanlama
-        self.score_min_area_ratio = config.get("score_min_area_ratio", 0.05)
-        self.score_max_area_ratio = config.get("score_max_area_ratio", 0.95)
-        self.min_score_threshold = config.get("min_score_threshold", 0.2)
-
-        # Uzman 1: Hızlı Gözcü
-        self.s1_canny_min = config.get("s1_canny_min", 50)
-        self.s1_canny_max = config.get("s1_canny_max", 150)
-
-        # Uzman 2: Sınır Gözcüsü
-        self.s2_blur_ratio = config.get("s2_blur_ratio", 5)
-
-        # Uzman 3: Noktasal Köşe Avcısı (GitHub projesinden gelen mantık)
-        self.s3_max_corners = config.get("s3_max_corners", 100)
-        self.s3_quality_level = config.get("s3_quality_level", 0.01)
-        self.s3_min_distance = config.get("s3_min_distance", 20)
 
 
 # -----------------------------------------------------------------------------
-# 2. Geometri, Puanlama ve Yardımcı Fonksiyonlar
+# 2. Geometri ve Yardımcı Fonksiyonlar
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -76,70 +68,50 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _unsharp_mask(image: np.ndarray, strength: float) -> np.ndarray:
-    blurred = cv2.GaussianBlur(image, (0, 0), 3)
-    sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
-    return sharpened
-
-
-def _score_candidate(contour: np.ndarray, params: Params, image_shape: tuple) -> float:
-    h, w = image_shape[:2];
-    total_area = w * h
-    area = cv2.contourArea(contour)
-    if not (params.score_min_area_ratio < area / total_area < params.score_max_area_ratio): return 0.0
-    peri = cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, params.approx_poly_epsilon_ratio * peri, True)
-    if len(approx) != 4 or not cv2.isContourConvex(approx): return 0.0
-    return area / total_area
-
-
 # -----------------------------------------------------------------------------
-# 3. UZMAN STRATEJİLERİ
+# 3. GITHUB PROJESİNDEN ALINAN ANA TESPİT MANTIĞI
 # -----------------------------------------------------------------------------
-def stage1_fast_and_simple(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+def find_document_corners_from_repo(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
+    """ GitHub projesindeki mantığı kullanarak belge köşelerini bulur. """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged = cv2.Canny(blurred, params.s1_canny_min, params.s1_canny_max)
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
-    c = max(contours, key=cv2.contourArea)
-    if _score_candidate(c, params, image.shape) > params.min_score_threshold:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
-        return approx.reshape(4, 2).astype(np.float32)
-    return None
+    blurred = cv2.GaussianBlur(gray, params.blur_ksize, 0)
 
+    # Ana Strateji: goodFeaturesToTrack ile köşe avı
+    corners = cv2.goodFeaturesToTrack(
+        blurred,
+        maxCorners=params.feature_max_corners,
+        qualityLevel=params.feature_quality_level,
+        minDistance=params.feature_min_distance
+    )
 
-def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    kernel_size = int(min(image.shape[:2]) / params.s2_blur_ratio)
-    if kernel_size % 2 == 0: kernel_size += 1
-    blurred_bg = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
-    flattened = cv2.divide(gray, blurred_bg, scale=255)
-    _, thresh = cv2.threshold(flattened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=3)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours: return None
-    c = max(contours, key=cv2.contourArea)
-    if _score_candidate(c, params, image.shape) > params.min_score_threshold:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
-        return approx.reshape(4, 2).astype(np.float32)
-    return None
-
-
-def stage3_feature_detector(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    corners = cv2.goodFeaturesToTrack(gray, maxCorners=params.s3_max_corners, qualityLevel=params.s3_quality_level,
-                                      minDistance=params.s3_min_distance)
-    if corners is None or len(corners) < 4: return None
-    hull = cv2.convexHull(corners)
-    if _score_candidate(hull, params, image.shape) > params.min_score_threshold:
+    if corners is not None and len(corners) >= 4:
+        print("Bilgi: Köşeler 'goodFeaturesToTrack' ile bulundu.")
+        corners = np.squeeze(corners)
+        # En dıştaki dörtgeni bulmak için Convex Hull kullanmak daha sağlamdır
+        hull = cv2.convexHull(corners)
         peri = cv2.arcLength(hull, True)
         approx = cv2.approxPolyDP(hull, params.approx_poly_epsilon_ratio * peri, True)
         if len(approx) == 4:
-            return _order_points(approx.reshape(4, 2)).astype(np.float32)
+            return approx.reshape(4, 2).astype(np.float32)
+
+    # Yedek Strateji: Eğer köşe bulunamazsa, kontur tabanlı tespiti dene
+    print("Uyarı: 'goodFeaturesToTrack' başarısız, kontur tabanlı yedek deneniyor...")
+    edged = cv2.Canny(blurred, params.canny_min, params.canny_max)
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours: return None
+
+    # En büyük 5 konturu dene
+    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        total_area = image.shape[0] * image.shape[1]
+        if cv2.contourArea(c) < total_area * params.contour_min_area_ratio:
+            continue
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            print("Bilgi: Köşeler kontur tabanlı yedek ile bulundu.")
+            return approx.reshape(4, 2).astype(np.float32)
+
     return None
 
 
@@ -174,32 +146,24 @@ class PerspectiveCorrection(Component):
         src_img_orig = self._prepare_image(img_obj.value)
         h, w = src_img_orig.shape[:2]
 
+        # Görüntüyü standart bir boyuta indirge
         scale = self.params.resize_longest_edge / max(h, w)
         work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)))
-        work_img = _unsharp_mask(work_img, self.params.unsharp_strength)
 
         document_quad = None
         warped = None
 
-        strategies = {
-            "Hızlı Gözcü": stage1_fast_and_simple,
-            "Sınır Gözcüsü": stage2_boundary_watcher,
-            "Noktasal Köşe Avcısı": stage3_feature_detector,
-        }
+        print("GitHub projesindeki mantık deneniyor...")
+        candidate_quad_scaled = find_document_corners_from_repo(work_img, self.params)
 
-        for name, strategy in strategies.items():
-            print(f"Aşama ( {name} ) deneniyor...")
-            candidate_quad_scaled = strategy(work_img, self.params)
-            if candidate_quad_scaled is not None:
-                document_quad = candidate_quad_scaled / scale
-                warped_candidate = _four_point_transform(src_img_orig, document_quad)
-                if warped_candidate is not None:
-                    print(f"Başarılı: Belge '{name}' stratejisi ile bulundu.")
-                    warped = warped_candidate
-                    break
+        if candidate_quad_scaled is not None:
+            document_quad = candidate_quad_scaled / scale  # Köşeleri orijinal boyuta geri ölçekle
+            warped = _four_point_transform(src_img_orig, document_quad)
+            if warped is not None:
+                print("Başarılı: Belge bulundu ve düzeltildi.")
 
         if warped is None:
-            print("Tüm uzmanlar başarısız. Fallback olarak tüm görüntü kullanılıyor.")
+            print("Tespit başarısız. Fallback olarak tüm görüntü kullanılıyor.")
             warped = src_img_orig
             document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
 

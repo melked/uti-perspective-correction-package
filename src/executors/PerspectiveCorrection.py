@@ -17,37 +17,34 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 # 1. PARAMETRE YÖNETİMİ
 # -----------------------------------------------------------------------------
 class Params:
-    """ Tüm algoritma parametrelerini merkezi yönetir """
     def __init__(self, config=None):
         config = config or {}
-        # Genel
         self.resize_longest_edge = config.get("resize_longest_edge", 1000)
-        # Ön işleme
         self.blur_ksize = tuple(config.get("blur_ksize", (5, 5)))
-        # Canny
-        self.canny_min = config.get("canny_min", 75)
-        self.canny_max = config.get("canny_max", 200)
-        # Köşe tespiti
-        self.feature_max_corners = config.get("feature_max_corners", 50)
+        self.canny_min = config.get("canny_min", 50)
+        self.canny_max = config.get("canny_max", 150)
+        self.feature_max_corners = config.get("feature_max_corners", 100)
         self.feature_quality_level = config.get("feature_quality_level", 0.01)
-        self.feature_min_distance = config.get("feature_min_distance", 20)
-        # Kontur tabanlı yedek
-        self.contour_min_area_ratio = config.get("contour_min_area_ratio", 0.05)
+        self.feature_min_distance = config.get("feature_min_distance", 10)
+        self.contour_min_area_ratio = config.get("contour_min_area_ratio", 0.03)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
+        self.clahe_clip = config.get("clahe_clip", 2.0)
+        self.gamma = config.get("gamma", 1.2)
+        self.unsharp_amount = config.get("unsharp_amount", 1.5)
 
 
 # -----------------------------------------------------------------------------
-# 2. GEOMETRİ VE YARDIMCI FONKSİYONLAR
+# 2. GEOMETRİ
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # top-left
-    rect[2] = pts[np.argmax(s)]  # bottom-right
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
     return rect
 
 
@@ -68,15 +65,36 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> Optional[np.nda
 
 
 # -----------------------------------------------------------------------------
-# 3. BELGE KÖŞESİ BULMA (goodFeatures + Contour)
+# 3. ÖN İŞLEME FUNKSIYONLARI
+# -----------------------------------------------------------------------------
+def apply_clahe(img_gray, clip=2.0):
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
+    return clahe.apply(img_gray)
+
+
+def adjust_gamma(image, gamma=1.2):
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(256)]).astype("uint8")
+    return cv2.LUT(image, table)
+
+
+def unsharp_mask(image, amount=1.5):
+    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    return cv2.addWeighted(image, 1 + amount, blurred, -amount, 0)
+
+
+# -----------------------------------------------------------------------------
+# 4. BELGE KÖŞESİ BULMA (ÇOKLU STRATEJİ)
 # -----------------------------------------------------------------------------
 def find_document_corners(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, params.blur_ksize, 0)
+    gray = apply_clahe(gray, params.clahe_clip)
+    gray = adjust_gamma(gray, params.gamma)
+    gray = unsharp_mask(gray, params.unsharp_amount)
 
-    # Ana strateji: goodFeaturesToTrack
+    # --- goodFeaturesToTrack ---
     corners = cv2.goodFeaturesToTrack(
-        blurred,
+        gray,
         maxCorners=params.feature_max_corners,
         qualityLevel=params.feature_quality_level,
         minDistance=params.feature_min_distance
@@ -89,12 +107,13 @@ def find_document_corners(image: np.ndarray, params: Params) -> Optional[np.ndar
         if len(approx) == 4:
             return approx.reshape(4, 2).astype(np.float32)
 
-    # Yedek: kontur tabanlı
+    # --- Kontur tabanlı yedek ---
+    blurred = cv2.GaussianBlur(gray, params.blur_ksize, 0)
     edged = cv2.Canny(blurred, params.canny_min, params.canny_max)
     contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         total_area = image.shape[0] * image.shape[1]
-        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
             if cv2.contourArea(c) < total_area * params.contour_min_area_ratio:
                 continue
             peri = cv2.arcLength(c, True)
@@ -105,7 +124,7 @@ def find_document_corners(image: np.ndarray, params: Params) -> Optional[np.ndar
 
 
 # -----------------------------------------------------------------------------
-# 4. ANA COMPONENT
+# 5. ANA COMPONENT
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -137,7 +156,6 @@ class PerspectiveCorrection(Component):
         src_img = self._prepare_image(img_obj.value)
         h, w = src_img.shape[:2]
 
-        # Scale işlemi
         scale = self.params.resize_longest_edge / max(h, w)
         work_img = cv2.resize(src_img, (int(w * scale), int(h * scale)))
 
@@ -153,7 +171,7 @@ class PerspectiveCorrection(Component):
                 print("Başarılı: Belge bulundu ve düzeltildi.")
 
         if warped is None:
-            print("Tespit başarısız. Fallback olarak tüm görüntü kullanılıyor.")
+            print("Tespit başarısız. Tüm görüntü kullanılıyor.")
             warped = src_img
             document_quad = np.array([[0, 0], [w-1, 0], [w-1, h-1], [0, h-1]], dtype=np.float32)
 
@@ -165,7 +183,7 @@ class PerspectiveCorrection(Component):
 
 
 # -----------------------------------------------------------------------------
-# 5. ÇALIŞTIRICI
+# 6. ÇALIŞTIRICI
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

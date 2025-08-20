@@ -24,13 +24,17 @@ class Params:
 
     def __init__(self, config=None):
         config = config or {}
-        # Genel Puanlama
+        # Genel Parametreler
         self.score_min_area_ratio = config.get("score_min_area_ratio", 0.03)
         self.score_max_area_ratio = config.get("score_max_area_ratio", 0.95)
         self.score_min_threshold = config.get("score_min_threshold", 0.25)
+        # <<< EKLENDİ: Gözden kaçan approx_poly_epsilon_ratio parametresi eklendi.
+        self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
 
         # Stage 1: Hızlı Gözcü
         self.s1_blur_ksize = tuple(config.get("s1_blur_ksize", (5, 5)))
+        self.canny_min = config.get("canny_min", 50)
+        self.canny_max = config.get("canny_max", 150)
 
         # Stage 2: Sınır Gözcüsü
         self.s2_blur_ratio = config.get("s2_blur_ratio", 5)
@@ -51,7 +55,7 @@ class Params:
 
 
 # -----------------------------------------------------------------------------
-# 2. Geometri, Puanlama ve Yardımcı Fonksiyonlar
+# 2. Geometri, Puanlama ve Yardımcı Fonksiyonlar (Değişiklik Yok)
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -86,17 +90,9 @@ def _score_candidate(contour: np.ndarray, params: Params, image_shape: tuple) ->
     area = cv2.contourArea(contour)
     if not (params.score_min_area_ratio < area / total_area < params.score_max_area_ratio): return 0.0
     peri = cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+    approx = cv2.approxPolyDP(contour, params.approx_poly_epsilon_ratio * peri, True)
     if len(approx) != 4 or not cv2.isContourConvex(approx): return 0.0
     return area / total_area
-
-
-def _get_canny_param_sets(image: np.ndarray) -> List[Tuple[int, int]]:
-    v = np.median(image);
-    sigma = 0.33
-    auto_lower = int(max(0, (1.0 - sigma) * v));
-    auto_upper = int(min(255, (1.0 + sigma) * v))
-    return list(dict.fromkeys([(auto_lower, auto_upper), (30, 90), (50, 150)]))
 
 
 def _line_intersection(line1, line2):
@@ -112,24 +108,21 @@ def _line_intersection(line1, line2):
 
 
 # -----------------------------------------------------------------------------
-# 3. UZMAN STRATEJİLERİ
+# 3. UZMAN STRATEJİLERİ (Değişiklik Yok, Sadece artık params'tan okuyorlar)
 # -----------------------------------------------------------------------------
-
 def stage1_fast_and_simple(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, params.s1_blur_ksize, 0)
-    best_quad, best_score = None, params.score_min_threshold
-    for lower, upper in _get_canny_param_sets(blurred):
-        edged = cv2.Canny(blurred, lower, upper)
-        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: continue
-        c = max(contours, key=cv2.contourArea)
-        score = _score_candidate(c, params, image.shape)
-        if score > best_score:
-            best_score = score
-            peri = cv2.arcLength(c, True)
-            best_quad = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
-    return best_quad.reshape(4, 2).astype(np.float32) if best_quad is not None else None
+    edged = cv2.Canny(blurred, params.canny_min, params.canny_max)
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    c = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
+    if len(approx) == 4 and cv2.isContourConvex(approx) and _score_candidate(c, params,
+                                                                             image.shape) > params.score_min_threshold:
+        return approx.reshape(4, 2).astype(np.float32)
+    return None
 
 
 def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.ndarray]:
@@ -146,7 +139,8 @@ def stage2_boundary_watcher(image: np.ndarray, params: Params) -> Optional[np.nd
     c = max(contours, key=cv2.contourArea)
     peri = cv2.arcLength(c, True)
     approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
-    if len(approx) == 4 and _score_candidate(c, params, image.shape) > params.score_min_threshold:
+    if len(approx) == 4 and cv2.isContourConvex(approx) and _score_candidate(c, params,
+                                                                             image.shape) > params.score_min_threshold:
         return approx.reshape(4, 2).astype(np.float32)
     return None
 
@@ -214,7 +208,7 @@ def stage5_line_reconstructor(image: np.ndarray, params: Params) -> Optional[np.
 
 
 # -----------------------------------------------------------------------------
-# Ana Bileşen
+# 4. Ana Bileşen
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -279,7 +273,7 @@ class PerspectiveCorrection(Component):
 
 
 # -----------------------------------------------------------------------------
-# Çalıştırıcı
+# 5. Çalıştırıcı
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

@@ -2,6 +2,7 @@ import os
 import sys
 import cv2
 import numpy as np
+import math
 from typing import Optional, List, Tuple
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
@@ -15,21 +16,26 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 class PerspectiveCorrection(Component):
     """
-    PyImageSearch makalesindeki klasik ve güçlü adımları kullanarak
-    perspektif düzeltme yapan bileşen.
+    İki aşamalı hibrit yaklaşım kullanan bileşen:
+    1. Hızlı kontur tespiti.
+    2. Başarısız olursa, güçlü kenar kesişimi (Hough) tespiti.
     """
 
     class Params:
-        """Algoritma için temel parametreler."""
+        """Algoritma için birleştirilmiş parametreler."""
 
         def __init__(self, config=None):
             config = config or {}
-            # Performans için yeniden boyutlandırma yüksekliği
+            # Genel
             self.resize_height = config.get("resize_height", 500)
-            # Kontur tespiti için minimum alan oranı
-            self.min_area_ratio = config.get("min_area_ratio", 0.15)
-            # Dörtgen yaklaştırma hassasiyeti
+            self.min_area_ratio = config.get("min_area_ratio", 0.05)  # Esnek alan oranı
+            # Kontur Stratejisi
             self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
+            # Hough Stratejisi
+            self.hough_line_threshold = config.get("hough_line_threshold", 50)
+            self.hough_min_line_length = config.get("hough_min_line_length", 50)
+            self.hough_max_line_gap = config.get("hough_max_line_gap", 10)
+            self.hough_angle_tolerance = config.get("hough_angle_tolerance", 10)
 
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
@@ -45,7 +51,6 @@ class PerspectiveCorrection(Component):
 
     # --- GEOMETRİ VE YARDIMCI METOTLAR ---
     def _order_points(self, pts: np.ndarray) -> np.ndarray:
-        """4 noktayı sol-üst, sağ-üst, sağ-alt, sol-alt olarak sıralar."""
         pts = pts.reshape(4, 2)
         rect = np.zeros((4, 2), dtype="float32")
         s = pts.sum(axis=1);
@@ -57,7 +62,6 @@ class PerspectiveCorrection(Component):
         return rect
 
     def _four_point_transform(self, image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-        """Sıralanmış 4 noktayı kullanarak perspektif düzeltme uygular."""
         rect = self._order_points(pts)
         (tl, tr, br, bl) = rect
         widthA = np.linalg.norm(br - bl);
@@ -66,51 +70,80 @@ class PerspectiveCorrection(Component):
         heightB = np.linalg.norm(tl - bl)
         maxWidth = int(max(widthA, widthB));
         maxHeight = int(max(heightA, heightB))
-
         dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
-        M = cv2.getPerspectiveTransform(rect, dst)
-        return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+        M = cv.getPerspectiveTransform(rect, dst)
+        return cv.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv.INTER_LANCZOS4)
 
-    # --- PYIMAGESEARCH AKIŞINI UYGULAYAN METOTLAR ---
-    def _preprocess_for_detection(self, image: np.ndarray) -> np.ndarray:
-        """Adım 1 & 2: Görüntüyü griye çevir, bulanıklaştır ve kenarları bul."""
+    def _line_intersection(self, line1, line2) -> Optional[Tuple[int, int]]:
+        x1, y1, x2, y2 = line1[0];
+        x3, y3, x4, y4 = line2[0]
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if denom == 0: return None
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        ix = int(x1 + t * (x2 - x1));
+        iy = int(y1 + t * (y2 - y1))
+        return (ix, iy)
+
+    # --- TESPİT STRATEJİLERİ ---
+    def _find_quad_with_contours(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """Klasik kontur bulma yöntemini uygular."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edged = cv2.Canny(blurred, 75, 200)
-        print("Ön işleme tamamlandı: Gri tonlama -> Gaussian Blur -> Canny Edge")
-        return edged
+        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours: return None
 
-    def _find_document_contour(self, edged_image: np.ndarray) -> Optional[np.ndarray]:
-        """Adım 3: Kenar haritasındaki en büyük dörtgeni bulur."""
-        # Not: cv2.RETR_EXTERNAL, sadece en dış konturları bularak performansı artırır.
-        contours, _ = cv2.findContours(edged_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            print("Hiç kontur bulunamadı.")
-            return None
-
-        # Konturları alana göre büyükten küçüğe sırala
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-        # En büyük konturları gezerek 4 köşeli olanı ara
         for c in contours:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, self.params.approx_poly_epsilon_ratio * peri, True)
-
-            # Eğer konturumuzun 4 köşesi varsa, onu belge olarak kabul et
             if len(approx) == 4:
-                print("4 köşeli belge konturu bulundu.")
                 return approx.reshape(4, 2).astype(np.float32)
-
-        print("4 köşeli bir kontur bulunamadı.")
         return None
 
-    # --- ANA İŞ AKIŞI: ORKESTRA ŞEFİ ---
+    def _find_quad_with_hough(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """Kenar kesişimi (Hough) yöntemini uygular."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        edged = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edged, 1, np.pi / 180,
+                                threshold=self.params.hough_line_threshold,
+                                minLineLength=self.params.hough_min_line_length,
+                                maxLineGap=self.params.hough_max_line_gap)
+        if lines is None: return None
+
+        horizontal, vertical = [], []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
+            if angle < self.params.hough_angle_tolerance or abs(angle - 180) < self.params.hough_angle_tolerance:
+                horizontal.append(line)
+            elif abs(angle - 90) < self.params.hough_angle_tolerance:
+                vertical.append(line)
+
+        if len(horizontal) < 2 or len(vertical) < 2: return None
+
+        horizontal.sort(key=lambda line: line[0][1]);
+        vertical.sort(key=lambda line: line[0][0])
+        top_line, bottom_line = horizontal[0], horizontal[-1]
+        left_line, right_line = vertical[0], vertical[-1]
+
+        tl = self._line_intersection(top_line, left_line)
+        tr = self._line_intersection(top_line, right_line)
+        bl = self._line_intersection(bottom_line, left_line)
+        br = self._line_intersection(bottom_line, right_line)
+
+        if all((tl, tr, bl, br)):
+            return np.array([tl, tr, br, bl], dtype=np.float32)
+        return None
+
+    # --- ANA İŞ AKIŞI ---
     def run(self):
-        # 1. Hazırlık: Görüntüyü yükle ve hazırla
+        # 1. Hazırlık
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("Girdi görüntüsü alınamadı.")
 
         src_img_orig = img_obj.value
+        # Görüntü hazırlama (normalize, renk kanalları vb.)
         if src_img_orig.dtype != np.uint8: src_img_orig = cv2.normalize(src_img_orig, None, 0, 255,
                                                                         cv2.NORM_MINMAX).astype(np.uint8)
         if src_img_orig.ndim == 2:
@@ -118,35 +151,33 @@ class PerspectiveCorrection(Component):
         elif src_img_orig.shape[-1] == 4:
             src_img_orig = cv2.cvtColor(src_img_orig, cv2.COLOR_BGRA2BGR)
 
-        # Orijinal en/boy oranını koru
         h_orig, w_orig = src_img_orig.shape[:2]
         ratio = h_orig / self.params.resize_height
-
-        # Performans için görüntüyü yeniden boyutlandır
         work_img = cv2.resize(src_img_orig, (int(w_orig / ratio), self.params.resize_height))
 
-        # 2. Ön İşleme ve Kenar Tespiti
-        edged_image = self._preprocess_for_detection(work_img)
+        # 2. AŞAMA 1: Hızlı Kontur Yöntemini Dene
+        print("Aşama 1: Hızlı kontur tespiti deneniyor...")
+        document_quad_scaled = self._find_quad_with_contours(work_img)
 
-        # 3. Belge Konturunu Bulma
-        document_quad_scaled = self._find_document_contour(edged_image)
+        # 3. AŞAMA 2: Eğer Gerekirse Kenar Kesişimi Yöntemini Dene
+        if document_quad_scaled is None:
+            print("Kontur yöntemi başarısız. Aşama 2: Kenar kesişimi (Hough) yöntemi deneniyor...")
+            document_quad_scaled = self._find_quad_with_hough(work_img)
 
         warped = None
         document_quad_orig = None
 
-        # 4. Perspektif Düzeltme (Eğer kontur bulunduysa)
+        # 4. Perspektif Düzeltme
         if document_quad_scaled is not None:
-            # Köşe noktalarını orijinal görüntü boyutuna geri ölçekle
             document_quad_orig = document_quad_scaled * ratio
 
-            # Alan kontrolü yap
             if cv2.contourArea(document_quad_orig) / (w_orig * h_orig) > self.params.min_area_ratio:
-                print("Perspektif dönüşümü uygulanıyor...")
+                print("Geçerli bir dörtgen bulundu. Perspektif dönüşümü uygulanıyor...")
                 warped = self._four_point_transform(src_img_orig, document_quad_orig)
             else:
-                print("Bulunan kontur minimum alan oranının altında kaldı.")
+                print("Bulunan dörtgen minimum alan oranının altında kaldı.")
 
-        # 5. Sonuçlandırma (Eğer bir şey ters gittiyse fallback)
+        # 5. Sonuçlandırma
         if warped is None:
             print("Geçerli bir belge bulunamadı. Orijinal görüntü kullanılıyor (fallback).")
             warped = src_img_orig

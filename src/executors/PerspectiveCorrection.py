@@ -16,8 +16,8 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 class PerspectiveCorrection(Component):
     """
-    Çoklu strateji (hibrit) yaklaşımını ve akıllı puanlamayı kullanan,
-    tek ve entegre edilmiş nihai perspektif düzeltme bileşeni.
+    Klasik ve gelişmiş tespit yöntemlerini birleştiren hibrit (hibrit) bir yaklaşımla,
+    her türlü ortamda belge tespiti ve perspektif düzeltmesi yapan nihai bileşen.
     """
 
     class Params:
@@ -29,6 +29,7 @@ class PerspectiveCorrection(Component):
             self.min_area_ratio = config.get("min_area_ratio", 0.1)
             self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
             self.min_confidence_threshold = config.get("min_confidence_threshold", 0.5)
+            # Hough Stratejisi için Parametreler
             self.hough_line_threshold = config.get("hough_line_threshold", 50)
             self.hough_min_line_length = config.get("hough_min_line_length", 50)
             self.hough_max_line_gap = config.get("hough_max_line_gap", 15)
@@ -46,7 +47,7 @@ class PerspectiveCorrection(Component):
     def bootstrap(config: dict) -> dict:
         return {}
 
-    # --- GEOMETRİ VE YARDIMCI METOTLAR ---
+    # --- 1. Geometri ve Yardımcı Metotlar ---
     def _order_points(self, pts: np.ndarray) -> np.ndarray:
         pts = pts.reshape(4, 2)
         rect = np.zeros((4, 2), dtype="float32")
@@ -81,15 +82,20 @@ class PerspectiveCorrection(Component):
         iy = int(y1 + t * (y2 - y1))
         return ix, iy
 
-    # --- "UZMAN" ADAY ÜRETME STRATEJİLERİ ---
-    def _strategy_canny_contours(self, image_gray: np.ndarray) -> List[np.ndarray]:
-        blurred = cv2.bilateralFilter(image_gray, 9, 75, 75)
-        edged = cv2.Canny(blurred, 50, 150)
+    # --- 2. "Uzman" Aday Üretme Stratejileri ---
+    def _strategy_classic_contours(self, image_gray: np.ndarray) -> List[np.ndarray]:
+        """Dokümanlardaki klasik Canny + Kontur yöntemini uygular."""
+        print("   -> Uzman 1 (Klasik Kontur) çalışıyor...")
+        blurred = cv2.GaussianBlur(image_gray, (5, 5), 0)
+        edged = cv2.Canny(blurred, 75, 200)
+        # Kenarlardaki boşlukları birleştirmek için morfolojik kapatma
         closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return self._get_quads_from_contours(contours)
 
     def _strategy_hough_intersections(self, image_gray: np.ndarray) -> List[np.ndarray]:
+        """Hough çizgilerini kesiştirir (düşük kontrast ve karmaşık zeminler için)."""
+        print("   -> Uzman 2 (Hough Kesişim) çalışıyor...")
         edged = cv2.Canny(image_gray, 50, 150, apertureSize=3)
         lines = cv2.HoughLinesP(edged, 1, np.pi / 180, self.params.hough_line_threshold,
                                 minLineLength=self.params.hough_min_line_length,
@@ -114,16 +120,18 @@ class PerspectiveCorrection(Component):
         return []
 
     def _get_quads_from_contours(self, contours: List[np.ndarray]) -> List[np.ndarray]:
+        """Verilen kontur listesinden 4 köşeli olanları ayıklar."""
         quads = []
-        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:  # En büyük 5 adaya bakmak yeterli
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, self.params.approx_poly_epsilon_ratio * peri, True)
             if len(approx) == 4 and cv2.isContourConvex(approx):
                 quads.append(approx.reshape(4, 2).astype(np.float32))
         return quads
 
-    # --- AKILLI PUANLAMA ---
+    # --- 3. Akıllı Puanlama ---
     def _score_candidate(self, quad: np.ndarray, image_gray: np.ndarray) -> float:
+        """Bir adayı geometri ve içerik özelliklerine göre puanlar."""
         h, w = image_gray.shape;
         total_area = h * w
         contour = quad.astype(np.int32)
@@ -148,9 +156,9 @@ class PerspectiveCorrection(Component):
 
         return (content_score * 0.5) + (centrality * 0.2) + (aspect_score * 0.2) + (area / total_area * 0.1)
 
-    # --- ANA İŞ AKIŞI ---
+    # --- 4. Ana İş Akışı (Orkestra Şefi) ---
     def run(self):
-        # 1. Hazırlık
+        # Adım 1: Görüntüyü Hazırla
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("Girdi görüntüsü alınamadı.")
 
@@ -167,10 +175,10 @@ class PerspectiveCorrection(Component):
         work_img = cv2.resize(src_img_orig, (int(w_orig / ratio), self.params.resize_height))
         work_img_gray = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
 
-        # 2. Aday Üretme (Hibrit Uzmanlar Komitesi)
-        print("Uzmanlar adayları üretiyor...")
+        # Adım 2: Hibrit Uzmanlar Komitesi ile Aday Üret
+        print("Hibrit Uzmanlar Komitesi adayları üretiyor...")
         candidates = []
-        candidates.extend(self._strategy_canny_contours(work_img_gray))
+        candidates.extend(self._strategy_classic_contours(work_img_gray))
         candidates.extend(self._strategy_hough_intersections(work_img_gray))
 
         document_quad_orig = None
@@ -187,7 +195,7 @@ class PerspectiveCorrection(Component):
                     if not any(np.allclose(cand, uc, atol=20) for uc in unique_candidates):
                         unique_candidates.append(cand)
 
-            # 3. En İyi Adayı Seçme
+            # Adım 3: Akıllı Puanlama ile En İyi Adayı Seç
             print(f"{len(unique_candidates)} benzersiz aday değerlendiriliyor...")
             scored_candidates = [(self._score_candidate(q, work_img_gray), q) for q in unique_candidates]
             scored_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -201,14 +209,14 @@ class PerspectiveCorrection(Component):
             else:
                 print(f"En iyi adayın puanı ({best_score:.2f}) minimum eşiğin altında kaldı.")
 
-        # 4. Sonuçlandırma (Fallback)
+        # Adım 4: Sonuçlandırma (Fallback)
         if warped is None:
             print("Geçerli bir belge bulunamadı. Orijinal görüntü kullanılıyor.")
             warped = src_img_orig
             document_quad_orig = np.array([[0, 0], [w_orig - 1, 0], [w_orig - 1, h_orig - 1], [0, h_orig - 1]],
                                           dtype=np.float32)
 
-        # 5. Çıktıları Kaydetme
+        # Adım 5: Çıktıları Sisteme Kaydet
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
         self.context["src_quad"] = document_quad_orig.tolist()

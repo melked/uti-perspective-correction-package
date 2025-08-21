@@ -2,10 +2,9 @@ import os
 import sys
 import cv2
 import numpy as np
-import math
-from typing import Optional, List, Tuple
+from PIL import Image as PILImage
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../../../'))
 
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
@@ -14,87 +13,115 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 
-# -----------------------------------------------------------------------------
-# 1. PARAMETRE YÖNETİMİ (BASİTLEŞTİRİLDİ)
-# -----------------------------------------------------------------------------
 class Params:
     def __init__(self, config=None):
         config = config or {}
-        self.resize_longest_edge = config.get("resize_longest_edge", 1200)  # Daha yüksek çözünürlükle çalışalım
-        self.score_min_area_ratio = config.get("score_min_area_ratio", 0.15)
+        self.clahe_clip = config.get("clahe_clip", 3.0)
+        self.clahe_grid = tuple(config.get("clahe_grid", (8, 8)))
+        self.blur_ksize = tuple(config.get("blur_ksize", (5, 5)))
+        self.morph_kernel_size = config.get("morph_kernel_size", 5)
+        self.max_corners = config.get("max_corners", 20)
+        self.quality_level = config.get("quality_level", 0.01)
+        self.min_distance = config.get("min_distance", 20)
+        self.contour_area_thresh = config.get("contour_area_thresh", 1000)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
-        self.min_confidence_threshold = config.get("min_confidence_threshold",
-                                                   0.5)  # Yüksek kaliteli bir sonuç arıyoruz
+        # Canny eşikleri opsiyonel, yoksa otomatik hesaplanacak
+        self.canny_min = config.get("canny_min", None)
+        self.canny_max = config.get("canny_max", None)
 
 
-# -----------------------------------------------------------------------------
-# 2. YARDIMCI & GEOMETRİ FONKSİYONLARI
-# -----------------------------------------------------------------------------
-def _order_points(pts: np.ndarray) -> np.ndarray:
-    pts = pts.reshape(4, 2)
+def order_points(pts):
     rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1);
-    rect[0] = pts[np.argmin(s)];
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis=1);
-    rect[1] = pts[np.argmin(diff)];
-    rect[3] = pts[np.argmax(diff)]
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]  # Top-left
+    rect[2] = pts[np.argmax(s)]  # Bottom-right
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # Top-right
+    rect[3] = pts[np.argmax(diff)]  # Bottom-left
     return rect
 
 
-def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> Optional[np.ndarray]:
-    rect = _order_points(pts)
+def preprocess(img, params: Params):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=params.clahe_clip, tileGridSize=params.clahe_grid)
+    enhanced = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(enhanced, params.blur_ksize, 0)
+    return blurred
+
+
+def detect_corners(img, params: Params):
+    corners = cv2.goodFeaturesToTrack(img,
+                                      maxCorners=params.max_corners,
+                                      qualityLevel=params.quality_level,
+                                      minDistance=params.min_distance)
+    if corners is None or len(corners) < 4:
+        contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        for cnt in contours:
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, params.approx_poly_epsilon_ratio * peri, True)
+            if len(approx) == 4 and cv2.contourArea(approx) > params.contour_area_thresh:
+                return order_points(approx.reshape(4, 2))
+        return None
+    corners = np.squeeze(corners)
+    if len(corners) > 4:
+        center = corners.mean(axis=0)
+        dists = np.linalg.norm(corners - center, axis=1)
+        idxs = np.argsort(dists)[-4:]
+        corners = corners[idxs]
+    return order_points(corners)
+
+
+def four_point_transform(img, pts):
+    rect = order_points(pts)
     (tl, tr, br, bl) = rect
-    widthA = np.linalg.norm(br - bl);
+
+    widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
-    heightA = np.linalg.norm(tr - br);
+    maxWidth = int(max(widthA, widthB))
+
+    heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
-    maxWidth = max(int(widthA), int(widthB));
-    maxHeight = max(int(heightA), int(heightB))
-    if maxWidth <= 10 or maxHeight <= 10: return None
-    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+    maxHeight = int(max(heightA, heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]
+    ], dtype="float32")
+
     M = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
+    warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
+    return warped
 
 
-# -----------------------------------------------------------------------------
-# 3. "EVRENSEL" ÖN İŞLEME ZİNCİRİ
-# -----------------------------------------------------------------------------
-def universal_preprocess(image: np.ndarray) -> np.ndarray:
-    """
-    Her türlü ışık ve zemin koşuluna uyum sağlamak için tasarlanmış
-    detaylı bir ön işleme zinciri.
-    """
-    # Adım 1: LAB Renk Uzayında Işık Kanalını (L) Al
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l_channel, a, b = cv2.split(lab)
+def correct_perspective(img, params: Params):
+    pre = preprocess(img, params)
 
-    # Adım 2: Gölgeleri ve Işık Farklarını Yok Et (Illumination Normalization)
-    # Görüntünün genel aydınlatma desenini (çok bulanık versiyonu) bul
-    h, w = l_channel.shape
-    blur_kernel_size = int(w / 3)
-    if blur_kernel_size % 2 == 0: blur_kernel_size += 1
-    blurred_l = cv2.GaussianBlur(l_channel, (blur_kernel_size, blur_kernel_size), 0)
-    # Orijinal aydınlatmayı çıkararak düzleştir
-    normalized_l = cv2.divide(l_channel, blurred_l, scale=255)
+    # Otomatik Canny eşiği hesaplama (median tabanlı)
+    if params.canny_min is None or params.canny_max is None:
+        v = np.median(pre)
+        sigma = 0.33
+        lower = int(max(0, (1.0 - sigma) * v))
+        upper = int(min(255, (1.0 + sigma) * v))
+    else:
+        lower, upper = params.canny_min, params.canny_max
 
-    # Adım 3: Yerel Kontrastı Artır (CLAHE)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced_l = clahe.apply(normalized_l)
-
-    # Adım 4: Kenarları Koruyarak Gürültü Temizle
-    denoised_l = cv2.medianBlur(enhanced_l, 5)
-
-    return denoised_l
+    edges = cv2.Canny(pre, lower, upper)
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
+                             np.ones((params.morph_kernel_size, params.morph_kernel_size), np.uint8))
+    corners = detect_corners(edges, params)
+    if corners is None:
+        raise ValueError("Belge köşeleri bulunamadı.")
+    warped = four_point_transform(img, corners)
+    return PILImage.fromarray(warped)
 
 
-# -----------------------------------------------------------------------------
-# 4. ANA BİLEŞEN (TEK VE GÜÇLÜ BİR YAPI İLE)
-# -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
         super().__init__(request, bootstrap)
-        self.context = {}
         self.request.model = PackageModel(**(self.request.data))
         self.image = self.request.get_param("inputImage")
         params_data = self.request.get_param("params", {})
@@ -104,73 +131,22 @@ class PerspectiveCorrection(Component):
     def bootstrap(config: dict) -> dict:
         return {}
 
-    def _prepare_image(self, img: np.ndarray) -> np.ndarray:
-        if img is None or img.size == 0: raise ValueError("Input image is empty or None.")
-        if img.dtype != np.uint8: img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[-1] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-        return img
-
     def run(self):
-        img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
-        if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
+        img = Image.get_frame(img=self.image, redis_db=self.redis_db)
+        img_np = img.value
 
-        src_img_orig = self._prepare_image(img_obj.value)
-        h, w = src_img_orig.shape[:2]
-
-        scale = self.params.resize_longest_edge / max(h, w) if max(h, w) > self.params.resize_longest_edge else 1
-        work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-
-        # 1. Adım: Evrensel Ön İşlemeyi Uygula
-        print("Evrensel ön işleme zinciri çalıştırılıyor...")
-        processed_img = universal_preprocess(work_img)
-
-        # 2. Adım: Temiz Görüntüden Kenarları ve Konturları Bul
-        edged = cv2.Canny(processed_img, 30, 100)
-        closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
-                                  iterations=3)
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        document_quad = None
-        if contours:
-            # Sadece en büyük alanı olan konturu al, çünkü ön işleme sonrası en belirgin o olmalı.
-            best_contour = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(best_contour)
-            total_area = work_img.shape[0] * work_img.shape[1]
-
-            if area / total_area > self.params.score_min_area_ratio:
-                peri = cv2.arcLength(best_contour, True)
-                approx = cv2.approxPolyDP(best_contour, self.params.approx_poly_epsilon_ratio * peri, True)
-
-                if len(approx) == 4 and cv2.isContourConvex(approx):
-                    print(f"Başarılı: Geçerli bir dörtgen bulundu.")
-                    document_quad = approx.reshape(4, 2).astype(np.float32)
-                else:
-                    print("Uyarı: En büyük kontur bir dörtgen değil.")
+        if img_np.dtype != np.uint8:
+            if img_np.max() <= 1.0:
+                img_np = (img_np * 255).astype(np.uint8)
             else:
-                print("Uyarı: En büyük konturun alanı çok küçük.")
-        else:
-            print("Uyarı: Ön işleme sonrası hiç kontur bulunamadı.")
+                img_np = img_np.astype(np.uint8)
 
-        # 3. Adım: Perspektifi Düzelt
-        warped = None
-        if document_quad is not None:
-            document_quad /= scale
-            warped = _four_point_transform(src_img_orig, document_quad)
-
-        if warped is None:
-            print("Tüm analizler başarısız. Fallback olarak orijinal görüntü kullanılıyor.")
-            warped = src_img_orig
-            document_quad = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
-
-        img_obj.value = warped
-        self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
-        self.context["src_quad"] = document_quad.tolist()
-        self.context["output_size"] = [warped.shape[1], warped.shape[0]]
+        result_img = correct_perspective(img_np, self.params)
+        img.value = np.array(result_img)
+        self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
         return build_response(context=self)
 
 
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()
+

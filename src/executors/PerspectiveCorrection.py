@@ -3,7 +3,7 @@ import sys
 import cv2
 import numpy as np
 import math
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -18,8 +18,6 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 # 1. PARAMETRE YÖNETİMİ SINIFI
 # -----------------------------------------------------------------------------
 class Params:
-    """Tüm algoritma parametrelerini yönetmek için merkezi bir sınıf."""
-
     def __init__(self, config=None):
         config = config or {}
         self.resize_longest_edge = config.get("resize_longest_edge", 1000)
@@ -27,7 +25,7 @@ class Params:
         self.score_min_area_ratio = config.get("score_min_area_ratio", 0.10)
         self.score_max_area_ratio = config.get("score_max_area_ratio", 0.98)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
-        self.min_confidence_threshold = config.get("min_confidence_threshold", 0.25)
+        self.min_confidence_threshold = config.get("min_confidence_threshold", 0.30)  # Eşik biraz daha katı
         self.hough_line_threshold = config.get("hough_line_threshold", 50)
         self.hough_min_line_length = config.get("hough_min_line_length", 50)
         self.hough_max_line_gap = config.get("hough_max_line_gap", 20)
@@ -70,26 +68,27 @@ def _unsharp_mask(image: np.ndarray, strength: float) -> np.ndarray:
 
 
 def _line_intersection(line1, line2) -> Optional[Tuple[int, int]]:
-    """İki çizginin kesişim noktasını hesaplar."""
     x1, y1, x2, y2 = line1[0]
     x3, y3, x4, y4 = line2[0]
     denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if denom == 0: return None  # Çizgiler paralel
-    t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-    u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
-    if 0 <= t <= 1 and 0 <= u <= 1:  # Kesişim segmentler üzerinde mi kontrolü (opsiyonel ama iyi)
-        ix = int(x1 + t * (x2 - x1))
-        iy = int(y1 + t * (y2 - y1))
-        return (ix, iy)
-    return None
+    if denom == 0: return None
+    t_num = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)
+    u_num = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3))
+    t = t_num / denom
+    u = u_num / denom
+    # Sadece kesişim noktası, segmentlerin üzerinde olmak zorunda değil, uzantılarında da olabilir.
+    # Bu yüzden 0<=t<=1 kontrolü daha esnek olmalı.
+    ix = int(x1 + t * (x2 - x1))
+    iy = int(y1 + t * (y2 - y1))
+    return (ix, iy)
 
 
 # -----------------------------------------------------------------------------
-# 3. UZMAN STRATEJİLERİ (HOUGH GÜÇLENDİRİLDİ)
+# 3. UZMAN STRATEJİLERİ
 # -----------------------------------------------------------------------------
 def _get_quads_from_contours(contours: List[np.ndarray], params: Params) -> List[np.ndarray]:
     quads = []
-    for c in contours:
+    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:  # En büyük 5 kontura bak
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
@@ -97,21 +96,21 @@ def _get_quads_from_contours(contours: List[np.ndarray], params: Params) -> List
     return quads
 
 
-def strategy_canny(image: np.ndarray, params: Params) -> List[np.ndarray]:
+def strategy_canny(image: np.ndarray, params: Params, is_dark_doc: bool = False) -> List[np.ndarray]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    v = np.median(blurred);
-    sigma = 0.33
-    lower = int(max(0, (1.0 - sigma) * v));
-    upper = int(min(255, (1.0 + sigma) * v))
-    edged = cv2.Canny(blurred, lower, upper)
-    closed = cv2.morphologyEx(edged, cv2.MORPH_RECT, (7, 7), iterations=2)
-    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    blurred = cv2.bilateralFilter(gray, 9, 75, 75)  # Kenar korumalı gürültü azaltma
+
+    # Koyu belgeler için farklı Canny eşikleri daha iyi çalışabilir
+    canny_low = 30 if is_dark_doc else 50
+    canny_high = 100 if is_dark_doc else 150
+    edged = cv2.Canny(blurred, canny_low, canny_high)
+
+    closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=3)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     return _get_quads_from_contours(contours, params)
 
 
 def strategy_hough_lines(image: np.ndarray, params: Params) -> List[np.ndarray]:
-    """Düz çizgileri bularak ve kesiştirerek dörtgen adayları üretir."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edged = cv2.Canny(gray, 50, 150, apertureSize=3)
     lines = cv2.HoughLinesP(edged, 1, np.pi / 180,
@@ -131,16 +130,14 @@ def strategy_hough_lines(image: np.ndarray, params: Params) -> List[np.ndarray]:
 
     if len(horizontal) < 2 or len(vertical) < 2: return []
 
-    # En dıştaki çizgileri kenar olarak seç
-    horizontal.sort(key=lambda line: line[0][1])
+    horizontal.sort(key=lambda line: line[0][1]);
     vertical.sort(key=lambda line: line[0][0])
     top_line, bottom_line = horizontal[0], horizontal[-1]
     left_line, right_line = vertical[0], vertical[-1]
 
-    # Kenarların kesişim noktalarını hesapla
-    tl = _line_intersection(top_line, left_line)
+    tl = _line_intersection(top_line, left_line);
     tr = _line_intersection(top_line, right_line)
-    bl = _line_intersection(bottom_line, left_line)
+    bl = _line_intersection(bottom_line, left_line);
     br = _line_intersection(bottom_line, right_line)
 
     if all((tl, tr, bl, br)):
@@ -152,7 +149,6 @@ def strategy_hough_lines(image: np.ndarray, params: Params) -> List[np.ndarray]:
 # -----------------------------------------------------------------------------
 
 def _score_quad(quad: np.ndarray, params: Params, image_shape: tuple) -> float:
-    """Doğrudan bir dörtgeni puanlar."""
     h, w = image_shape[:2];
     total_area = w * h
     contour = quad.astype(np.int32)
@@ -168,11 +164,11 @@ def _score_quad(quad: np.ndarray, params: Params, image_shape: tuple) -> float:
     if min(width, height) < 1: return 0.0
     aspect_ratio = max(width, height) / min(width, height)
     aspect_score = 1.0 if 1.1 < aspect_ratio < 2.2 else 0.5
-    return (area / total_area * 0.4) + (centrality * 0.4) + (aspect_score * 0.2)
+    return (centrality * 0.5) + (area / total_area * 0.3) + (aspect_score * 0.2)
 
 
 # -----------------------------------------------------------------------------
-# 5. ANA BİLEŞEN
+# 5. ANA BİLEŞEN (ADAPTİF MANTIK İLE)
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -196,27 +192,64 @@ class PerspectiveCorrection(Component):
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         return img
 
+    def _diagnose_image(self, image: np.ndarray) -> Dict:
+        """Görüntünün temel özelliklerini analiz ederek bir teşhis raporu oluşturur."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        mean = np.mean(gray)
+        std_dev = np.std(gray)
+
+        diagnostics = {
+            "brightness": "dark" if mean < 85 else "bright" if mean > 170 else "normal",
+            "contrast": "low" if std_dev < 40 else "normal",
+            "is_dark_doc": mean < 128  # Genel bir tahmin
+        }
+        print(f"Görüntü Teşhisi: {diagnostics}")
+        return diagnostics
+
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
+
         src_img_orig = self._prepare_image(img_obj.value)
         h, w = src_img_orig.shape[:2]
+
         scale = self.params.resize_longest_edge / max(h, w) if max(h, w) > self.params.resize_longest_edge else 1
         work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         work_img = _unsharp_mask(work_img, self.params.unsharp_strength)
+
+        # 1. Adım: Görüntüyü Teşhis Et
+        diagnostics = self._diagnose_image(work_img)
+
+        # 2. Adım: Teşhise Göre Stratejileri Önceliklendir
+        strategy_pipeline = []
+        if diagnostics["contrast"] == "low":
+            print("Düşük kontrast tespit edildi. Hough stratejisi önceliklendiriliyor.")
+            strategy_pipeline = [strategy_hough_lines, strategy_canny]
+        else:  # Normal veya yüksek kontrast
+            print("Normal kontrast tespit edildi. Canny stratejisi önceliklendiriliyor.")
+            strategy_pipeline = [strategy_canny, strategy_hough_lines]
+
+        # 3. Adım: Stratejileri Çalıştır ve En İyisini Seç
+        all_candidates = []
+        for strategy_func in strategy_pipeline:
+            print(f"Çalıştırılan strateji: {strategy_func.__name__}")
+            # Stratejiye özel argümanları geçir
+            if strategy_func.__name__ == 'strategy_canny':
+                candidates = strategy_func(work_img, self.params, is_dark_doc=diagnostics["is_dark_doc"])
+            else:
+                candidates = strategy_func(work_img, self.params)
+
+            if candidates:
+                print(f" -> {len(candidates)} aday bulundu.")
+                all_candidates.extend(candidates)
+
         document_quad = None
-
-        print("Tüm uzman stratejileri çalıştırılıyor...")
-        quad_candidates = []
-        quad_candidates.extend(strategy_hough_lines(work_img, self.params))
-        quad_candidates.extend(strategy_canny(work_img, self.params))
-
-        if not quad_candidates:
+        if not all_candidates:
             print("Hiçbir strateji aday üretemedi.")
             warped = None
         else:
-            print(f"{len(quad_candidates)} aday dörtgen bulundu. En iyisi seçiliyor...")
-            scored_candidates = [(_score_quad(q, self.params, work_img.shape), q) for q in quad_candidates]
+            print(f"Toplam {len(all_candidates)} aday dörtgen bulundu. En iyisi seçiliyor...")
+            scored_candidates = [(_score_quad(q, self.params, work_img.shape), q) for q in all_candidates]
             scored_candidates.sort(key=lambda x: x[0], reverse=True)
             best_score, best_quad = scored_candidates[0]
             if best_score > self.params.min_confidence_threshold:
@@ -225,8 +258,8 @@ class PerspectiveCorrection(Component):
             else:
                 print(
                     f"En iyi adayın puanı ({best_score:.2f}) minimum eşiğin ({self.params.min_confidence_threshold}) altında kaldı.")
-                document_quad = None
 
+        # 4. Adım: Son Dönüşüm
         warped = None
         if document_quad is not None:
             document_quad /= scale

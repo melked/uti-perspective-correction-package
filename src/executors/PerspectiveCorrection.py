@@ -13,7 +13,7 @@ from components.PerspectiveCorrection.src.utils.response import build_response
 from components.PerspectiveCorrection.src.models.PackageModel import PackageModel
 
 # -----------------------------------------------------------------------------
-# 1. PARAMETER MANAGEMENT CLASS (NEW)
+# 1. PARAMETER MANAGEMENT CLASS
 # -----------------------------------------------------------------------------
 class Params:
     """A centralized class to manage all algorithm parameters."""
@@ -67,7 +67,8 @@ def _unsharp_mask(image: np.ndarray, strength: float) -> np.ndarray:
 # -----------------------------------------------------------------------------
 def get_candidates_from_canny(image: np.ndarray) -> List[np.ndarray]:
     """Generates contour candidates using auto Canny edge detection."""
-    gray = cv2.cvtColor(image, cv.COLOR_BGR2GRAY)
+    # THIS LINE IS FIXED
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     v = np.median(blurred); sigma = 0.33
     lower = int(max(0, (1.0 - sigma) * v)); upper = int(min(255, (1.0 + sigma) * v))
@@ -188,7 +189,7 @@ class PerspectiveCorrection(Component):
         # --- Stage 2: Deep Analysis (Fallback) ---
         if document_quad is None:
             print("No high-confidence candidate found. Analyzing all candidates...")
-            if fast_candidates:
+            if fast_candidates and scored_candidates: # Ensure list is not empty
                 # Use the best candidate found, even if it's below the high-confidence threshold
                 best_deep_score, best_deep_candidate = scored_candidates[0]
                 if best_deep_score > self.params.min_confidence_threshold:

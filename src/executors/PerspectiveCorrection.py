@@ -5,8 +5,8 @@ import numpy as np
 import math
 from typing import Optional, List, Tuple
 
+# Sisteminize uygun import yolları
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
-
 from sdks.novavision.src.media.image import Image
 from sdks.novavision.src.base.component import Component
 from sdks.novavision.src.helper.executor import Executor
@@ -16,25 +16,22 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 class PerspectiveCorrection(Component):
     """
-    İki aşamalı hibrit yaklaşım kullanan bileşen:
-    1. Hızlı kontur tespiti.
-    2. Başarısız olursa, güçlü kenar kesişimi (Hough) tespiti.
+    Çoklu strateji (hibrit) yaklaşımını ve akıllı puanlamayı kullanan,
+    tek ve entegre edilmiş nihai perspektif düzeltme bileşeni.
     """
 
     class Params:
-        """Algoritma için birleştirilmiş parametreler."""
+        """Tüm algoritma parametrelerini yönetmek için iç içe sınıf."""
 
         def __init__(self, config=None):
             config = config or {}
-            # Genel
-            self.resize_height = config.get("resize_height", 500)
-            self.min_area_ratio = config.get("min_area_ratio", 0.05)  # Esnek alan oranı
-            # Kontur Stratejisi
+            self.resize_height = config.get("resize_height", 800)
+            self.min_area_ratio = config.get("min_area_ratio", 0.1)
             self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
-            # Hough Stratejisi
+            self.min_confidence_threshold = config.get("min_confidence_threshold", 0.5)
             self.hough_line_threshold = config.get("hough_line_threshold", 50)
             self.hough_min_line_length = config.get("hough_min_line_length", 50)
-            self.hough_max_line_gap = config.get("hough_max_line_gap", 10)
+            self.hough_max_line_gap = config.get("hough_max_line_gap", 15)
             self.hough_angle_tolerance = config.get("hough_angle_tolerance", 10)
 
     def __init__(self, request, bootstrap):
@@ -71,8 +68,8 @@ class PerspectiveCorrection(Component):
         maxWidth = int(max(widthA, widthB));
         maxHeight = int(max(heightA, heightB))
         dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
-        M = cv.getPerspectiveTransform(rect, dst)
-        return cv.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv.INTER_LANCZOS4)
+        M = cv2.getPerspectiveTransform(rect, dst)
+        return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
     def _line_intersection(self, line1, line2) -> Optional[Tuple[int, int]]:
         x1, y1, x2, y2 = line1[0];
@@ -82,35 +79,22 @@ class PerspectiveCorrection(Component):
         t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
         ix = int(x1 + t * (x2 - x1));
         iy = int(y1 + t * (y2 - y1))
-        return (ix, iy)
+        return ix, iy
 
-    # --- TESPİT STRATEJİLERİ ---
-    def _find_quad_with_contours(self, image: np.ndarray) -> Optional[np.ndarray]:
-        """Klasik kontur bulma yöntemini uygular."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blurred, 75, 200)
-        contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return None
+    # --- "UZMAN" ADAY ÜRETME STRATEJİLERİ ---
+    def _strategy_canny_contours(self, image_gray: np.ndarray) -> List[np.ndarray]:
+        blurred = cv2.bilateralFilter(image_gray, 9, 75, 75)
+        edged = cv2.Canny(blurred, 50, 150)
+        closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return self._get_quads_from_contours(contours)
 
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)
-        for c in contours:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, self.params.approx_poly_epsilon_ratio * peri, True)
-            if len(approx) == 4:
-                return approx.reshape(4, 2).astype(np.float32)
-        return None
-
-    def _find_quad_with_hough(self, image: np.ndarray) -> Optional[np.ndarray]:
-        """Kenar kesişimi (Hough) yöntemini uygular."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        edged = cv2.Canny(gray, 50, 150, apertureSize=3)
-        lines = cv2.HoughLinesP(edged, 1, np.pi / 180,
-                                threshold=self.params.hough_line_threshold,
+    def _strategy_hough_intersections(self, image_gray: np.ndarray) -> List[np.ndarray]:
+        edged = cv2.Canny(image_gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edged, 1, np.pi / 180, self.params.hough_line_threshold,
                                 minLineLength=self.params.hough_min_line_length,
                                 maxLineGap=self.params.hough_max_line_gap)
-        if lines is None: return None
-
+        if lines is None: return []
         horizontal, vertical = [], []
         for line in lines:
             x1, y1, x2, y2 = line[0]
@@ -119,22 +103,50 @@ class PerspectiveCorrection(Component):
                 horizontal.append(line)
             elif abs(angle - 90) < self.params.hough_angle_tolerance:
                 vertical.append(line)
+        if len(horizontal) < 2 or len(vertical) < 2: return []
+        horizontal.sort(key=lambda l: l[0][1]);
+        vertical.sort(key=lambda l: l[0][0])
+        tl = self._line_intersection(horizontal[0], vertical[0]);
+        tr = self._line_intersection(horizontal[0], vertical[-1])
+        bl = self._line_intersection(horizontal[-1], vertical[0]);
+        br = self._line_intersection(horizontal[-1], vertical[-1])
+        if all((tl, tr, bl, br)): return [np.array([tl, tr, br, bl], dtype=np.float32)]
+        return []
 
-        if len(horizontal) < 2 or len(vertical) < 2: return None
+    def _get_quads_from_contours(self, contours: List[np.ndarray]) -> List[np.ndarray]:
+        quads = []
+        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, self.params.approx_poly_epsilon_ratio * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                quads.append(approx.reshape(4, 2).astype(np.float32))
+        return quads
 
-        horizontal.sort(key=lambda line: line[0][1]);
-        vertical.sort(key=lambda line: line[0][0])
-        top_line, bottom_line = horizontal[0], horizontal[-1]
-        left_line, right_line = vertical[0], vertical[-1]
+    # --- AKILLI PUANLAMA ---
+    def _score_candidate(self, quad: np.ndarray, image_gray: np.ndarray) -> float:
+        h, w = image_gray.shape;
+        total_area = h * w
+        contour = quad.astype(np.int32)
+        area = cv2.contourArea(contour)
+        if not (self.params.min_area_ratio < area / total_area < 0.98): return 0.0
 
-        tl = self._line_intersection(top_line, left_line)
-        tr = self._line_intersection(top_line, right_line)
-        bl = self._line_intersection(bottom_line, left_line)
-        br = self._line_intersection(bottom_line, right_line)
+        M = cv2.moments(contour)
+        if M["m00"] == 0: return 0.0
+        cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
+        centrality = 1.0 - (np.linalg.norm(np.array([cx, cy]) - np.array([w / 2, h / 2])) / (max(w, h) / 2))
 
-        if all((tl, tr, bl, br)):
-            return np.array([tl, tr, br, bl], dtype=np.float32)
-        return None
+        width = (np.linalg.norm(quad[1] - quad[0]) + np.linalg.norm(quad[2] - quad[3])) / 2
+        height = (np.linalg.norm(quad[3] - quad[0]) + np.linalg.norm(quad[2] - quad[1])) / 2
+        aspect_ratio = max(width, height) / (min(width, height) + 1e-6)
+        aspect_score = 1.0 if 1.2 < aspect_ratio < 2.0 else 0.5
+
+        mask = np.zeros(image_gray.shape, dtype="uint8");
+        cv2.fillPoly(mask, [contour], 255)
+        edged_content = cv2.Canny(image_gray, 50, 150)
+        edge_pixel_count = np.count_nonzero(cv2.bitwise_and(edged_content, edged_content, mask=mask))
+        content_score = min((edge_pixel_count / area) / 0.1, 1.0) if area > 0 else 0
+
+        return (content_score * 0.5) + (centrality * 0.2) + (aspect_score * 0.2) + (area / total_area * 0.1)
 
     # --- ANA İŞ AKIŞI ---
     def run(self):
@@ -143,7 +155,6 @@ class PerspectiveCorrection(Component):
         if img_obj is None or img_obj.value is None: raise ValueError("Girdi görüntüsü alınamadı.")
 
         src_img_orig = img_obj.value
-        # Görüntü hazırlama (normalize, renk kanalları vb.)
         if src_img_orig.dtype != np.uint8: src_img_orig = cv2.normalize(src_img_orig, None, 0, 255,
                                                                         cv2.NORM_MINMAX).astype(np.uint8)
         if src_img_orig.ndim == 2:
@@ -154,43 +165,55 @@ class PerspectiveCorrection(Component):
         h_orig, w_orig = src_img_orig.shape[:2]
         ratio = h_orig / self.params.resize_height
         work_img = cv2.resize(src_img_orig, (int(w_orig / ratio), self.params.resize_height))
+        work_img_gray = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
 
-        # 2. AŞAMA 1: Hızlı Kontur Yöntemini Dene
-        print("Aşama 1: Hızlı kontur tespiti deneniyor...")
-        document_quad_scaled = self._find_quad_with_contours(work_img)
+        # 2. Aday Üretme (Hibrit Uzmanlar Komitesi)
+        print("Uzmanlar adayları üretiyor...")
+        candidates = []
+        candidates.extend(self._strategy_canny_contours(work_img_gray))
+        candidates.extend(self._strategy_hough_intersections(work_img_gray))
 
-        # 3. AŞAMA 2: Eğer Gerekirse Kenar Kesişimi Yöntemini Dene
-        if document_quad_scaled is None:
-            print("Kontur yöntemi başarısız. Aşama 2: Kenar kesişimi (Hough) yöntemi deneniyor...")
-            document_quad_scaled = self._find_quad_with_hough(work_img)
-
-        warped = None
         document_quad_orig = None
+        warped = None
 
-        # 4. Perspektif Düzeltme
-        if document_quad_scaled is not None:
-            document_quad_orig = document_quad_scaled * ratio
+        if not candidates:
+            print("Hiçbir uzman aday bulamadı.")
+        else:
+            # Tekrarlanan adayları kaldır
+            unique_candidates = []
+            if candidates:
+                unique_candidates.append(candidates[0])
+                for cand in candidates[1:]:
+                    if not any(np.allclose(cand, uc, atol=20) for uc in unique_candidates):
+                        unique_candidates.append(cand)
 
-            if cv2.contourArea(document_quad_orig) / (w_orig * h_orig) > self.params.min_area_ratio:
-                print("Geçerli bir dörtgen bulundu. Perspektif dönüşümü uygulanıyor...")
+            # 3. En İyi Adayı Seçme
+            print(f"{len(unique_candidates)} benzersiz aday değerlendiriliyor...")
+            scored_candidates = [(self._score_candidate(q, work_img_gray), q) for q in unique_candidates]
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+            best_score, best_quad_scaled = scored_candidates[0]
+
+            if best_score > self.params.min_confidence_threshold:
+                print(f"En iyi aday {best_score:.2f} puanla seçildi.")
+                document_quad_orig = best_quad_scaled * ratio
                 warped = self._four_point_transform(src_img_orig, document_quad_orig)
             else:
-                print("Bulunan dörtgen minimum alan oranının altında kaldı.")
+                print(f"En iyi adayın puanı ({best_score:.2f}) minimum eşiğin altında kaldı.")
 
-        # 5. Sonuçlandırma
+        # 4. Sonuçlandırma (Fallback)
         if warped is None:
-            print("Geçerli bir belge bulunamadı. Orijinal görüntü kullanılıyor (fallback).")
+            print("Geçerli bir belge bulunamadı. Orijinal görüntü kullanılıyor.")
             warped = src_img_orig
             document_quad_orig = np.array([[0, 0], [w_orig - 1, 0], [w_orig - 1, h_orig - 1], [0, h_orig - 1]],
                                           dtype=np.float32)
 
-        # 6. Çıktıları Kaydetme
+        # 5. Çıktıları Kaydetme
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
         self.context["src_quad"] = document_quad_orig.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
 
-        print("İşlem tamamlandı.")
         return build_response(context=self)
 
 

@@ -42,12 +42,56 @@ def order_points(pts):
     return rect
 
 
-def preprocess(img, params: Params):
+# --- 🔹 PREPROCESS VARIANTS ---
+def preprocess_variants(img, params: Params):
+    variants = []
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 1. CLAHE + Blur
     clahe = cv2.createCLAHE(clipLimit=params.clahe_clip, tileGridSize=params.clahe_grid)
     enhanced = clahe.apply(gray)
-    blurred = cv2.GaussianBlur(enhanced, params.blur_ksize, 0)
-    return blurred
+    variants.append(cv2.GaussianBlur(enhanced, params.blur_ksize, 0))
+
+    # 2. Gamma correction (farklı ışık koşulları için)
+    for gamma in [0.7, 1.3]:
+        gamma_img = np.array(255 * (gray / 255.0) ** (1.0 / gamma), dtype='uint8')
+        variants.append(cv2.GaussianBlur(gamma_img, (3, 3), 0))
+
+    # 3. Unsharp mask (keskinleştirme)
+    blur = cv2.GaussianBlur(gray, (9, 9), 10)
+    unsharp = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+    variants.append(unsharp)
+
+    return variants
+
+
+# --- 🔹 EDGE VARIANTS ---
+def edge_variants(img, params: Params):
+    edges = []
+
+    # 1. Canny (otomatik threshold)
+    if params.canny_min is None or params.canny_max is None:
+        v = np.median(img)
+        sigma = 0.33
+        lower = int(max(0, (1.0 - sigma) * v))
+        upper = int(min(255, (1.0 + sigma) * v))
+    else:
+        lower, upper = params.canny_min, params.canny_max
+    edges.append(cv2.Canny(img, lower, upper))
+
+    # 2. Adaptive Threshold
+    edges.append(cv2.adaptiveThreshold(img, 255,
+                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 11, 2))
+
+    # 3. Sobel
+    sobelx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+    sobel = cv2.magnitude(sobelx, sobely)
+    sobel = np.uint8(np.clip(sobel, 0, 255))
+    edges.append(sobel)
+
+    return edges
 
 
 def detect_corners(img, params: Params):
@@ -97,26 +141,53 @@ def four_point_transform(img, pts):
     return warped
 
 
-def correct_perspective(img, params: Params):
-    pre = preprocess(img, params)
-
-    # Otomatik Canny eşiği hesaplama (median tabanlı)
-    if params.canny_min is None or params.canny_max is None:
-        v = np.median(pre)
-        sigma = 0.33
-        lower = int(max(0, (1.0 - sigma) * v))
-        upper = int(min(255, (1.0 + sigma) * v))
-    else:
-        lower, upper = params.canny_min, params.canny_max
-
-    edges = cv2.Canny(pre, lower, upper)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE,
-                             np.ones((params.morph_kernel_size, params.morph_kernel_size), np.uint8))
-    corners = detect_corners(edges, params)
+# --- 🔹 QUAD SCORING ---
+def evaluate_quad(corners, img_shape):
+    """Dörtgenin düzgünlüğüne puan verir."""
     if corners is None:
+        return 0
+
+    (h, w) = img_shape[:2]
+    rect = order_points(corners)
+
+    # Alan oranı (belge ekranın %10'undan küçükse düşük puan)
+    area = cv2.contourArea(rect.astype(np.int32))
+    score_area = min(area / (w * h), 1.0)
+
+    # Açılar (90 dereceye yakınsa iyi)
+    def angle(p1, p2, p3):
+        v1, v2 = p1 - p2, p3 - p2
+        cosang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        return np.degrees(np.arccos(np.clip(cosang, -1.0, 1.0)))
+
+    angles = []
+    for i in range(4):
+        angles.append(angle(rect[i], rect[(i + 1) % 4], rect[(i + 2) % 4]))
+    score_angle = 1 - (np.std(angles) / 90)  # ne kadar dikdörtgene yakınsa o kadar iyi
+
+    return 0.7 * score_area + 0.3 * score_angle
+
+
+# --- 🔹 ANA FONKSİYON ---
+def correct_perspective_auto(img, params: Params):
+    candidates = []
+
+    for pre in preprocess_variants(img, params):
+        for edge in edge_variants(pre, params):
+            edge = cv2.morphologyEx(edge, cv2.MORPH_CLOSE,
+                                    np.ones((params.morph_kernel_size, params.morph_kernel_size), np.uint8))
+            corners = detect_corners(edge, params)
+            if corners is not None:
+                warped = four_point_transform(img, corners)
+                score = evaluate_quad(corners, warped.shape)
+                candidates.append((score, warped))
+
+    if not candidates:
         raise ValueError("Belge köşeleri bulunamadı.")
-    warped = four_point_transform(img, corners)
-    return PILImage.fromarray(warped)
+
+    # En iyi skorlu belgeyi döndür
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return PILImage.fromarray(candidates[0][1])
 
 
 class PerspectiveCorrection(Component):
@@ -141,7 +212,7 @@ class PerspectiveCorrection(Component):
             else:
                 img_np = img_np.astype(np.uint8)
 
-        result_img = correct_perspective(img_np, self.params)
+        result_img = correct_perspective_auto(img_np, self.params)
         img.value = np.array(result_img)
         self.image = Image.set_frame(img=img, package_uID=self.uID, redis_db=self.redis_db)
         return build_response(context=self)
@@ -149,4 +220,3 @@ class PerspectiveCorrection(Component):
 
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()
-

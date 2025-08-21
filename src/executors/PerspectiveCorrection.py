@@ -3,7 +3,7 @@ import sys
 import cv2
 import numpy as np
 import math
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../../"))
 
@@ -15,28 +15,20 @@ from components.PerspectiveCorrection.src.models.PackageModel import PackageMode
 
 
 # -----------------------------------------------------------------------------
-# 1. PARAMETRE YÖNETİMİ SINIFI (GÜNCELLENDİ)
+# 1. PARAMETRE YÖNETİMİ (BASİTLEŞTİRİLDİ)
 # -----------------------------------------------------------------------------
 class Params:
     def __init__(self, config=None):
         config = config or {}
-        self.resize_longest_edge = config.get("resize_longest_edge", 1000)
-        self.unsharp_strength = config.get("unsharp_strength", 1.5)
-        self.score_min_area_ratio = config.get("score_min_area_ratio", 0.10)
-        self.score_max_area_ratio = config.get("score_max_area_ratio", 0.98)
+        self.resize_longest_edge = config.get("resize_longest_edge", 1200)  # Daha yüksek çözünürlükle çalışalım
+        self.score_min_area_ratio = config.get("score_min_area_ratio", 0.15)
         self.approx_poly_epsilon_ratio = config.get("approx_poly_epsilon_ratio", 0.02)
-        self.min_confidence_threshold = config.get("min_confidence_threshold", 0.30)
-        self.hough_line_threshold = config.get("hough_line_threshold", 50)
-        self.hough_min_line_length = config.get("hough_min_line_length", 50)
-        self.hough_max_line_gap = config.get("hough_max_line_gap", 20)
-        self.hough_angle_tolerance = config.get("hough_angle_tolerance", 10)
-        # YENİ: İçerik puanlaması için Canny eşikleri
-        self.content_canny_low = config.get("content_canny_low", 30)
-        self.content_canny_high = config.get("content_canny_high", 100)
+        self.min_confidence_threshold = config.get("min_confidence_threshold",
+                                                   0.5)  # Yüksek kaliteli bir sonuç arıyoruz
 
 
 # -----------------------------------------------------------------------------
-# 2. YARDIMCI & GEOMETRİ FONKSİYONLARI (DEĞİŞİKLİK YOK)
+# 2. YARDIMCI & GEOMETRİ FONKSİYONLARI
 # -----------------------------------------------------------------------------
 def _order_points(pts: np.ndarray) -> np.ndarray:
     pts = pts.reshape(4, 2)
@@ -65,125 +57,39 @@ def _four_point_transform(image: np.ndarray, pts: np.ndarray) -> Optional[np.nda
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
 
-def _unsharp_mask(image: np.ndarray, strength: float) -> np.ndarray:
-    blurred = cv2.GaussianBlur(image, (0, 0), 3)
-    return cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
-
-
-def _line_intersection(line1, line2) -> Optional[Tuple[int, int]]:
-    x1, y1, x2, y2 = line1[0]
-    x3, y3, x4, y4 = line2[0]
-    denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
-    if denom == 0: return None
-    t_num = (x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)
-    t = t_num / denom
-    ix = int(x1 + t * (x2 - x1))
-    iy = int(y1 + t * (y2 - y1))
-    return (ix, iy)
-
-
 # -----------------------------------------------------------------------------
-# 3. UZMAN STRATEJİLERİ (DEĞİŞİKLİK YOK)
+# 3. "EVRENSEL" ÖN İŞLEME ZİNCİRİ
 # -----------------------------------------------------------------------------
-def _get_quads_from_contours(contours: List[np.ndarray], params: Params) -> List[np.ndarray]:
-    quads = []
-    for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, params.approx_poly_epsilon_ratio * peri, True)
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            quads.append(approx.reshape(4, 2).astype(np.float32))
-    return quads
-
-
-def strategy_canny(image: np.ndarray, params: Params) -> List[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.bilateralFilter(gray, 9, 75, 75)
-    edged = cv2.Canny(blurred, 50, 150)
-    closed = cv2.morphologyEx(edged, cv2.MORPH_RECT, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=3)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return _get_quads_from_contours(contours, params)
-
-
-def strategy_hough_lines(image: np.ndarray, params: Params) -> List[np.ndarray]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edged = cv2.Canny(gray, 50, 150, apertureSize=3)
-    lines = cv2.HoughLinesP(edged, 1, np.pi / 180,
-                            threshold=params.hough_line_threshold,
-                            minLineLength=params.hough_min_line_length,
-                            maxLineGap=params.hough_max_line_gap)
-    if lines is None: return []
-    horizontal, vertical = [], []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle = abs(math.degrees(math.atan2(y2 - y1, x2 - x1)))
-        if angle < params.hough_angle_tolerance or abs(angle - 180) < params.hough_angle_tolerance:
-            horizontal.append(line)
-        elif abs(angle - 90) < params.hough_angle_tolerance:
-            vertical.append(line)
-    if len(horizontal) < 2 or len(vertical) < 2: return []
-    horizontal.sort(key=lambda line: line[0][1]);
-    vertical.sort(key=lambda line: line[0][0])
-    top_line, bottom_line = horizontal[0], horizontal[-1]
-    left_line, right_line = vertical[0], vertical[-1]
-    tl = _line_intersection(top_line, left_line);
-    tr = _line_intersection(top_line, right_line)
-    bl = _line_intersection(bottom_line, left_line);
-    br = _line_intersection(bottom_line, right_line)
-    if all((tl, tr, bl, br)): return [np.array([tl, tr, br, bl], dtype=np.float32)]
-    return []
-
-
-# -----------------------------------------------------------------------------
-# 4. PUANLAMA FONKSİYONU (YENİLENDİ)
-# -----------------------------------------------------------------------------
-def _score_quad(quad: np.ndarray, params: Params, image_gray: np.ndarray, edged_image: np.ndarray) -> float:
+def universal_preprocess(image: np.ndarray) -> np.ndarray:
     """
-    Bir dörtgeni hem geometrisine hem de içeriğine göre puanlar.
+    Her türlü ışık ve zemin koşuluna uyum sağlamak için tasarlanmış
+    detaylı bir ön işleme zinciri.
     """
-    h, w = image_gray.shape[:2];
-    total_area = w * h
-    contour = quad.astype(np.int32)
+    # Adım 1: LAB Renk Uzayında Işık Kanalını (L) Al
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l_channel, a, b = cv2.split(lab)
 
-    # 1. Geometrik Puanlar
-    area = cv2.contourArea(contour)
-    if not (params.score_min_area_ratio < area / total_area < params.score_max_area_ratio): return 0.0
+    # Adım 2: Gölgeleri ve Işık Farklarını Yok Et (Illumination Normalization)
+    # Görüntünün genel aydınlatma desenini (çok bulanık versiyonu) bul
+    h, w = l_channel.shape
+    blur_kernel_size = int(w / 3)
+    if blur_kernel_size % 2 == 0: blur_kernel_size += 1
+    blurred_l = cv2.GaussianBlur(l_channel, (blur_kernel_size, blur_kernel_size), 0)
+    # Orijinal aydınlatmayı çıkararak düzleştir
+    normalized_l = cv2.divide(l_channel, blurred_l, scale=255)
 
-    M = cv2.moments(contour);
-    if M["m00"] == 0: return 0.0
-    cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
-    centrality = 1.0 - (np.linalg.norm(np.array([cx, cy]) - np.array([w / 2, h / 2])) / (max(w, h) / 2))
+    # Adım 3: Yerel Kontrastı Artır (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced_l = clahe.apply(normalized_l)
 
-    (tl, tr, br, bl) = _order_points(quad)
-    width = (np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2
-    height = (np.linalg.norm(tl - bl) + np.linalg.norm(tr - br)) / 2
-    if min(width, height) < 1: return 0.0
-    aspect_ratio = max(width, height) / min(width, height)
-    aspect_score = 1.0 if 1.1 < aspect_ratio < 2.2 else 0.5
+    # Adım 4: Kenarları Koruyarak Gürültü Temizle
+    denoised_l = cv2.medianBlur(enhanced_l, 5)
 
-    # 2. İçerik Puanı (YENİ VE EN ÖNEMLİ KISIM)
-    mask = np.zeros(image_gray.shape, dtype="uint8")
-    cv2.fillPoly(mask, [contour], 255)
-
-    # Kenar yoğunluğunu hesapla (daha normalleştirilmiş bir değer için)
-    masked_edges = cv2.bitwise_and(edged_image, edged_image, mask=mask)
-    edge_pixel_count = np.count_nonzero(masked_edges)
-    content_score = (edge_pixel_count / area) if area > 0 else 0
-    # Kenar yoğunluğunu [0, 1] aralığına getirmek için bir ölçekleme faktörü.
-    # 0.05 değeri, piksellerin %5'inin kenar olmasının iyi bir içerik göstergesi olduğu varsayımına dayanır.
-    content_score = min(content_score / 0.05, 1.0)
-
-    # 3. Final Ağırlıklı Puan
-    # İçerik puanına çok yüksek bir ağırlık veriyoruz!
-    final_score = (content_score * 0.5) + \
-                  (centrality * 0.25) + \
-                  (area / total_area * 0.15) + \
-                  (aspect_score * 0.1)
-
-    return final_score
+    return denoised_l
 
 
 # -----------------------------------------------------------------------------
-# 5. ANA BİLEŞEN (PUANLAMA ÇAĞRISI GÜNCELLENDİ)
+# 4. ANA BİLEŞEN (TEK VE GÜÇLÜ BİR YAPI İLE)
 # -----------------------------------------------------------------------------
 class PerspectiveCorrection(Component):
     def __init__(self, request, bootstrap):
@@ -210,44 +116,45 @@ class PerspectiveCorrection(Component):
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("No input image provided or failed to load.")
+
         src_img_orig = self._prepare_image(img_obj.value)
         h, w = src_img_orig.shape[:2]
 
         scale = self.params.resize_longest_edge / max(h, w) if max(h, w) > self.params.resize_longest_edge else 1
         work_img = cv2.resize(src_img_orig, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        work_img_sharp = _unsharp_mask(work_img, self.params.unsharp_strength)
 
-        # Puanlama için gerekli olan gri ve kenar haritasını başta bir kez oluştur
-        work_img_gray = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
-        work_img_edged = cv2.Canny(work_img_gray, self.params.content_canny_low, self.params.content_canny_high)
+        # 1. Adım: Evrensel Ön İşlemeyi Uygula
+        print("Evrensel ön işleme zinciri çalıştırılıyor...")
+        processed_img = universal_preprocess(work_img)
 
-        # Stratejileri Çalıştır
-        quad_candidates = []
-        print("Çalıştırılan strateji: strategy_hough_lines")
-        quad_candidates.extend(strategy_hough_lines(work_img_sharp, self.params))
-        print("Çalıştırılan strateji: strategy_canny")
-        quad_candidates.extend(strategy_canny(work_img_sharp, self.params))
+        # 2. Adım: Temiz Görüntüden Kenarları ve Konturları Bul
+        edged = cv2.Canny(processed_img, 30, 100)
+        closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+                                  iterations=3)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         document_quad = None
-        if not quad_candidates:
-            print("Hiçbir strateji aday üretemedi.")
-            warped = None
-        else:
-            print(f"Toplam {len(quad_candidates)} aday dörtgen bulundu. En iyisi seçiliyor...")
-            # Puanlama fonksiyonuna ek argümanları ver
-            scored_candidates = [(_score_quad(q, self.params, work_img_gray, work_img_edged), q) for q in
-                                 quad_candidates]
-            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        if contours:
+            # Sadece en büyük alanı olan konturu al, çünkü ön işleme sonrası en belirgin o olmalı.
+            best_contour = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(best_contour)
+            total_area = work_img.shape[0] * work_img.shape[1]
 
-            best_score, best_quad = scored_candidates[0]
-            if best_score > self.params.min_confidence_threshold:
-                print(f"En iyi aday {best_score:.2f} puanla bulundu.")
-                document_quad = best_quad
+            if area / total_area > self.params.score_min_area_ratio:
+                peri = cv2.arcLength(best_contour, True)
+                approx = cv2.approxPolyDP(best_contour, self.params.approx_poly_epsilon_ratio * peri, True)
+
+                if len(approx) == 4 and cv2.isContourConvex(approx):
+                    print(f"Başarılı: Geçerli bir dörtgen bulundu.")
+                    document_quad = approx.reshape(4, 2).astype(np.float32)
+                else:
+                    print("Uyarı: En büyük kontur bir dörtgen değil.")
             else:
-                print(
-                    f"En iyi adayın puanı ({best_score:.2f}) minimum eşiğin ({self.params.min_confidence_threshold}) altında kaldı.")
+                print("Uyarı: En büyük konturun alanı çok küçük.")
+        else:
+            print("Uyarı: Ön işleme sonrası hiç kontur bulunamadı.")
 
-        # Son Dönüşüm
+        # 3. Adım: Perspektifi Düzelt
         warped = None
         if document_quad is not None:
             document_quad /= scale
@@ -265,8 +172,5 @@ class PerspectiveCorrection(Component):
         return build_response(context=self)
 
 
-# -----------------------------------------------------------------------------
-# 6. ÇALIŞTIRICI
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()

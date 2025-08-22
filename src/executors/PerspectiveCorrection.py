@@ -39,7 +39,6 @@ class PerspectiveCorrection(Component):
     def bootstrap(config: dict) -> dict:
         return {}
 
-    # --- 1. Geometri ve Yardımcı Metotlar ---
     def _order_points(self, pts: np.ndarray) -> np.ndarray:
         pts = pts.reshape(4, 2)
         rect = np.zeros((4, 2), dtype="float32")
@@ -74,7 +73,6 @@ class PerspectiveCorrection(Component):
         iy = int(y1 + t * (y2 - y1))
         return ix, iy
 
-    # --- 2. "Uzman" Aday Üretme Stratejileri ---
     def _strategy_classic_contours(self, image_gray: np.ndarray) -> List[np.ndarray]:
         print("   -> Uzman 1 (Klasik Kontur) çalışıyor...")
         blurred = cv2.GaussianBlur(image_gray, (5, 5), 0)
@@ -116,7 +114,7 @@ class PerspectiveCorrection(Component):
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return self._get_quads_from_contours(contours)
 
-    # --- YENİ EKLENEN SÜPER UZMAN ---
+    # --- DÜZELTİLMİŞ SÜPER UZMAN ---
     def _strategy_universal_preprocess(self, image_bgr: np.ndarray) -> List[np.ndarray]:
         """En zorlu durumlar için evrensel ön işleme zincirini kullanır."""
         print("   -> Süper Uzman 4 (Evrensel Ön İşleme) çalışıyor...")
@@ -128,18 +126,25 @@ class PerspectiveCorrection(Component):
         if blur_kernel_size % 2 == 0: blur_kernel_size += 1
 
         blurred_l = cv2.GaussianBlur(l_channel, (blur_kernel_size, blur_kernel_size), 0)
+
+        # --- HATA DÜZELTMESİ BURADA ---
+        # Güvenli bölme işlemi için veri tiplerini float yap
+        l_channel_float = l_channel.astype(np.float32)
+        blurred_l_float = blurred_l.astype(np.float32)
+
         # 0'a bölünme hatasını önlemek için küçük bir epsilon ekle
-        normalized_l = cv2.divide(l_channel, blurred_l + 1e-6, scale=255)
+        normalized_l_float = cv2.divide(l_channel_float, blurred_l_float + 1e-6, scale=255)
+
+        # Sonraki adımlar için tekrar uint8'e çevir
+        normalized_l = np.clip(normalized_l_float, 0, 255).astype(np.uint8)
+        # ----------------------------
 
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced_l = clahe.apply(normalized_l)
 
         denoised_l = cv2.medianBlur(enhanced_l, 3)
 
-        # Bu 'mükemmel' görüntü üzerinde klasik kontur bulmayı dene
         return self._strategy_classic_contours(denoised_l)
-
-    # ------------------------------------
 
     def _get_quads_from_contours(self, contours: List[np.ndarray]) -> List[np.ndarray]:
         quads = []
@@ -150,7 +155,6 @@ class PerspectiveCorrection(Component):
                 quads.append(approx.reshape(4, 2).astype(np.float32))
         return quads
 
-    # --- 3. Akıllı Puanlama ---
     def _score_candidate(self, quad: np.ndarray, image_gray: np.ndarray) -> float:
         h, w = image_gray.shape;
         total_area = h * w
@@ -172,7 +176,6 @@ class PerspectiveCorrection(Component):
         content_score = min((edge_pixel_count / area) / 0.1, 1.0) if area > 0 else 0
         return (content_score * 0.5) + (centrality * 0.2) + (aspect_score * 0.2) + (area / total_area * 0.1)
 
-    # --- 4. Ana İş Akışı (Orkestra Şefi) ---
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("Girdi görüntüsü alınamadı.")
@@ -194,9 +197,7 @@ class PerspectiveCorrection(Component):
         candidates.extend(self._strategy_classic_contours(work_img_gray))
         candidates.extend(self._strategy_hough_intersections(work_img_gray))
         candidates.extend(self._strategy_adaptive_thresh(work_img_gray))
-        # YENİ SÜPER UZMANI BURADA ÇAĞIRIYORUZ (renkli görüntü ile)
         candidates.extend(self._strategy_universal_preprocess(work_img))
-        # ------------------------------------
 
         document_quad_orig = None
         warped = None

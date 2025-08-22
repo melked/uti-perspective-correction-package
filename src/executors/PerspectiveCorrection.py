@@ -108,15 +108,36 @@ class PerspectiveCorrection(Component):
         if all((tl, tr, bl, br)): return [np.array([tl, tr, br, bl], dtype=np.float32)]
         return []
 
-    # --- YENİ EKLENEN UZMAN STRATEJİ ---
     def _strategy_adaptive_thresh(self, image_gray: np.ndarray) -> List[np.ndarray]:
-        """Düşük kontrast ve değişken ışık uzmanı."""
         print("   -> Uzman 3 (Adaptif Eşikleme) çalışıyor...")
         blurred = cv2.bilateralFilter(image_gray, 11, 17, 17)
         thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
         closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return self._get_quads_from_contours(contours)
+
+    # --- YENİ EKLENEN SÜPER UZMAN ---
+    def _strategy_universal_preprocess(self, image_bgr: np.ndarray) -> List[np.ndarray]:
+        """En zorlu durumlar için evrensel ön işleme zincirini kullanır."""
+        print("   -> Süper Uzman 4 (Evrensel Ön İşleme) çalışıyor...")
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        l_channel, _, _ = cv2.split(lab)
+
+        h, w = l_channel.shape
+        blur_kernel_size = int(w / 3)
+        if blur_kernel_size % 2 == 0: blur_kernel_size += 1
+
+        blurred_l = cv2.GaussianBlur(l_channel, (blur_kernel_size, blur_kernel_size), 0)
+        # 0'a bölünme hatasını önlemek için küçük bir epsilon ekle
+        normalized_l = cv2.divide(l_channel, blurred_l + 1e-6, scale=255)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced_l = clahe.apply(normalized_l)
+
+        denoised_l = cv2.medianBlur(enhanced_l, 3)
+
+        # Bu 'mükemmel' görüntü üzerinde klasik kontur bulmayı dene
+        return self._strategy_classic_contours(denoised_l)
 
     # ------------------------------------
 
@@ -172,8 +193,9 @@ class PerspectiveCorrection(Component):
         candidates = []
         candidates.extend(self._strategy_classic_contours(work_img_gray))
         candidates.extend(self._strategy_hough_intersections(work_img_gray))
-        # --- YENİ UZMANI BURADA ÇAĞIRIYORUZ ---
         candidates.extend(self._strategy_adaptive_thresh(work_img_gray))
+        # YENİ SÜPER UZMANI BURADA ÇAĞIRIYORUZ (renkli görüntü ile)
+        candidates.extend(self._strategy_universal_preprocess(work_img))
         # ------------------------------------
 
         document_quad_orig = None
@@ -204,7 +226,7 @@ class PerspectiveCorrection(Component):
                                           dtype=np.float32)
 
         img_obj.value = warped
-        self.image = Image.set_frame(img = img_obj, package_uID = self.uID, redis_db = self.redis_db)
+        self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
         self.context["src_quad"] = document_quad_orig.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
         return build_response(context=self)

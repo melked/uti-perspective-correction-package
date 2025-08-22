@@ -36,43 +36,35 @@ class PerspectiveCorrection(Component):
         self.params = self.Params(params_data)
 
     @staticmethod
-    def bootstrap(config: dict) -> dict:
-        return {}
+    def bootstrap(config: dict) -> dict: return {}
 
+    # --- 1. Geometri ve Yardımcı Metotlar ---
     def _order_points(self, pts: np.ndarray) -> np.ndarray:
         pts = pts.reshape(4, 2)
         rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1);
-        rect[0] = pts[np.argmin(s)];
-        rect[2] = pts[np.argmax(s)]
-        diff = np.diff(pts, axis=1);
-        rect[1] = pts[np.argmin(diff)];
-        rect[3] = pts[np.argmax(diff)]
+        s = pts.sum(axis=1); rect[0] = pts[np.argmin(s)]; rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1); rect[1] = pts[np.argmin(diff)]; rect[3] = pts[np.argmax(diff)]
         return rect
 
     def _four_point_transform(self, image: np.ndarray, pts: np.ndarray) -> np.ndarray:
         rect = self._order_points(pts)
         (tl, tr, br, bl) = rect
-        widthA = np.linalg.norm(br - bl);
-        widthB = np.linalg.norm(tr - tl)
-        heightA = np.linalg.norm(tr - br);
-        heightB = np.linalg.norm(tl - bl)
-        maxWidth = int(max(widthA, widthB));
-        maxHeight = int(max(heightA, heightB))
+        widthA = np.linalg.norm(br - bl); widthB = np.linalg.norm(tr - tl)
+        heightA = np.linalg.norm(tr - br); heightB = np.linalg.norm(tl - bl)
+        maxWidth = int(max(widthA, widthB)); maxHeight = int(max(heightA, heightB))
         dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
         M = cv2.getPerspectiveTransform(rect, dst)
         return cv2.warpPerspective(image, M, (maxWidth, maxHeight), flags=cv2.INTER_LANCZOS4)
 
     def _line_intersection(self, line1, line2) -> Optional[Tuple[int, int]]:
-        x1, y1, x2, y2 = line1[0];
-        x3, y3, x4, y4 = line2[0]
+        x1, y1, x2, y2 = line1[0]; x3, y3, x4, y4 = line2[0]
         denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
         if denom == 0: return None
         t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
-        ix = int(x1 + t * (x2 - x1));
-        iy = int(y1 + t * (y2 - y1))
+        ix = int(x1 + t * (x2 - x1)); iy = int(y1 + t * (y2 - y1))
         return ix, iy
 
+    # --- 2. "Uzman" Aday Üretme Stratejileri ---
     def _strategy_classic_contours(self, image_gray: np.ndarray) -> List[np.ndarray]:
         print("   -> Uzman 1 (Klasik Kontur) çalışıyor...")
         blurred = cv2.GaussianBlur(image_gray, (5, 5), 0)
@@ -106,45 +98,15 @@ class PerspectiveCorrection(Component):
         if all((tl, tr, bl, br)): return [np.array([tl, tr, br, bl], dtype=np.float32)]
         return []
 
+    # YENİ UZMAN STRATEJİSİ: Düşük kontrast ve zorlu durumlar için.
     def _strategy_adaptive_thresh(self, image_gray: np.ndarray) -> List[np.ndarray]:
+        """Düşük kontrast ve değişken ışık uzmanı."""
         print("   -> Uzman 3 (Adaptif Eşikleme) çalışıyor...")
         blurred = cv2.bilateralFilter(image_gray, 11, 17, 17)
         thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 5)
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2)
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=2)
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return self._get_quads_from_contours(contours)
-
-    # --- DÜZELTİLMİŞ SÜPER UZMAN ---
-    def _strategy_universal_preprocess(self, image_bgr: np.ndarray) -> List[np.ndarray]:
-        """En zorlu durumlar için evrensel ön işleme zincirini kullanır."""
-        print("   -> Süper Uzman 4 (Evrensel Ön İşleme) çalışıyor...")
-        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-        l_channel, _, _ = cv2.split(lab)
-
-        h, w = l_channel.shape
-        blur_kernel_size = int(w / 3)
-        if blur_kernel_size % 2 == 0: blur_kernel_size += 1
-
-        blurred_l = cv2.GaussianBlur(l_channel, (blur_kernel_size, blur_kernel_size), 0)
-
-        # --- HATA DÜZELTMESİ BURADA ---
-        # Güvenli bölme işlemi için veri tiplerini float yap
-        l_channel_float = l_channel.astype(np.float32)
-        blurred_l_float = blurred_l.astype(np.float32)
-
-        # 0'a bölünme hatasını önlemek için küçük bir epsilon ekle
-        normalized_l_float = cv2.divide(l_channel_float, blurred_l_float + 1e-6, scale=255)
-
-        # Sonraki adımlar için tekrar uint8'e çevir
-        normalized_l = np.clip(normalized_l_float, 0, 255).astype(np.uint8)
-        # ----------------------------
-
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced_l = clahe.apply(normalized_l)
-
-        denoised_l = cv2.medianBlur(enhanced_l, 3)
-
-        return self._strategy_classic_contours(denoised_l)
 
     def _get_quads_from_contours(self, contours: List[np.ndarray]) -> List[np.ndarray]:
         quads = []
@@ -155,6 +117,7 @@ class PerspectiveCorrection(Component):
                 quads.append(approx.reshape(4, 2).astype(np.float32))
         return quads
 
+    # --- 3. Akıllı Puanlama ---
     def _score_candidate(self, quad: np.ndarray, image_gray: np.ndarray) -> float:
         h, w = image_gray.shape;
         total_area = h * w
@@ -176,16 +139,14 @@ class PerspectiveCorrection(Component):
         content_score = min((edge_pixel_count / area) / 0.1, 1.0) if area > 0 else 0
         return (content_score * 0.5) + (centrality * 0.2) + (aspect_score * 0.2) + (area / total_area * 0.1)
 
+    # --- 4. Ana İş Akışı (Orkestra Şefi) ---
     def run(self):
         img_obj = Image.get_frame(img=self.image, redis_db=self.redis_db)
         if img_obj is None or img_obj.value is None: raise ValueError("Girdi görüntüsü alınamadı.")
         src_img_orig = img_obj.value
-        if src_img_orig.dtype != np.uint8: src_img_orig = cv2.normalize(src_img_orig, None, 0, 255,
-                                                                        cv2.NORM_MINMAX).astype(np.uint8)
-        if src_img_orig.ndim == 2:
-            src_img_orig = cv2.cvtColor(src_img_orig, cv2.COLOR_GRAY2BGR)
-        elif src_img_orig.shape[-1] == 4:
-            src_img_orig = cv2.cvtColor(src_img_orig, cv2.COLOR_BGRA2BGR)
+        if src_img_orig.dtype != np.uint8: src_img_orig = cv2.normalize(src_img_orig, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if src_img_orig.ndim == 2: src_img_orig = cv2.cvtColor(src_img_orig, cv2.COLOR_GRAY2BGR)
+        elif src_img_orig.shape[-1] == 4: src_img_orig = cv2.cvtColor(src_img_orig, cv2.COLOR_BGRA2BGR)
 
         h_orig, w_orig = src_img_orig.shape[:2]
         ratio = h_orig / self.params.resize_height
@@ -196,8 +157,8 @@ class PerspectiveCorrection(Component):
         candidates = []
         candidates.extend(self._strategy_classic_contours(work_img_gray))
         candidates.extend(self._strategy_hough_intersections(work_img_gray))
+        # YENİ UZMANI BURADA ÇAĞIRIYORUZ
         candidates.extend(self._strategy_adaptive_thresh(work_img_gray))
-        candidates.extend(self._strategy_universal_preprocess(work_img))
 
         document_quad_orig = None
         warped = None
@@ -223,15 +184,13 @@ class PerspectiveCorrection(Component):
         if warped is None:
             print("Geçerli bir belge bulunamadı. Orijinal görüntü kullanılıyor.")
             warped = src_img_orig
-            document_quad_orig = np.array([[0, 0], [w_orig - 1, 0], [w_orig - 1, h_orig - 1], [0, h_orig - 1]],
-                                          dtype=np.float32)
+            document_quad_orig = np.array([[0, 0], [w_orig - 1, 0], [w_orig - 1, h_orig - 1], [0, h_orig - 1]], dtype=np.float32)
 
         img_obj.value = warped
         self.image = Image.set_frame(img=img_obj, package_uID=self.uID, redis_db=self.redis_db)
         self.context["src_quad"] = document_quad_orig.tolist()
         self.context["output_size"] = [warped.shape[1], warped.shape[0]]
         return build_response(context=self)
-
 
 if __name__ == "__main__":
     Executor(sys.argv[1]).run()
